@@ -29379,7 +29379,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "欢迎使用Synctrain！"
+            "value" : "欢迎使用 Synctrain！"
           }
         }
       }
@@ -29459,7 +29459,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当文件夹包含名为“index.html”的文件时，它将自动显示为网页。"
+            "value" : "当文件夹包含名为 'index.html' 的文件时，它将自动显示为网页。"
           }
         }
       }
@@ -29619,7 +29619,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用后，系统创建的某些文件（如.DS_Store）在选择性同步的文件夹中不会被识别为\"新文件\"。这些文件仍会在完全同步的文件夹中同步，也会在被其他设备创建时同步。"
+            "value" : "启用后，系统创建的某些文件（如 .DS_Store）在选择性同步的文件夹中不会被识别为新文件。这些文件仍会在完全同步的文件夹中同步，也会在被其他设备创建时同步。"
           }
         }
       }
@@ -29659,7 +29659,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用后，名称以点开头的文件和目录在浏览文件夹时将不会显示。这些文件和目录将在搜索结果中保持可见。"
+            "value" : "启用后，名称以.开头的文件和目录在浏览文件夹时将不会显示。这些文件和目录将在搜索结果中保持可见。"
           }
         }
       }
@@ -29819,7 +29819,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用后，应用将使用默认的STUN服务器。"
+            "value" : "启用后，应用将使用默认的 STUN 服务器。"
           }
         }
       }
@@ -29859,7 +29859,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "上次同步已经是很久以前的事了"
+            "value" : "当上次同步已经是很久以前时"
           }
         }
       }
@@ -30099,7 +30099,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "当您同步文件时，所有更改，包括删除文件，也会在您的其他设备上发生。不建议将Synctrain用于备份目的，请始终保留数据的备份。"
+            "value" : "当您同步文件时，所有更改，包括删除文件，也会在您的其他设备上发生。不建议将 Synctrain 用于备份目的，请始终保留数据的备份。"
           }
         }
       }
@@ -30139,7 +30139,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "充电时（长时间）"
+            "value" : "充电时（长时间同步）"
           }
         }
       }
@@ -30179,7 +30179,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在电池供电时"
+            "value" : "电池供电时（短时间同步）"
           }
         }
       }
