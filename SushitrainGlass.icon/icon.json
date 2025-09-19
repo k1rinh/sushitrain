@@ -1,4 +1,5 @@
 {
+  "color-space-for-untagged-svg-colors" : "display-p3",
   "fill-specializations" : [
     {
       "value" : {
@@ -277,7 +278,15 @@
       }
     },
     {
-      "blur-material" : null,
+      "blur-material-specializations" : [
+        {
+          "value" : null
+        },
+        {
+          "appearance" : "dark",
+          "value" : null
+        }
+      ],
       "layers" : [
         {
           "fill-specializations" : [
@@ -328,7 +337,7 @@
       ]
     },
     {
-      "blur-material" : 1,
+      "blur-material" : null,
       "layers" : [
         {
           "fill-specializations" : [

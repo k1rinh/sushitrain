@@ -52,41 +52,41 @@ struct TotalStatisticsView: View {
 
 #if os(iOS)
 	private struct ExportButtonView: View {
-		@State private var error: Error? = nil
-		@State private var showSuccess: Bool = false
+		enum ShowAlert {
+			case error(Error)
+			case success
+		}
+
 		@Environment(AppState.self) private var appState
+		@State private var showAlert: ShowAlert? = nil
 
 		var body: some View {
 			Button("Export configuration file") {
 				do {
 					try self.appState.client.exportConfigurationFile()
-					showSuccess = true
+					showAlert = .success
 				}
 				catch {
-					self.error = error
+					showAlert = .error(error)
 				}
 			}
 			.disabled(self.appState.client.isUsingCustomConfiguration)
-			.alert(
-				isPresented: Binding(
-					get: { return self.error != nil },
-					set: { nv in
-						if !nv {
-							self.error = nil
-						}
-					})
-			) {
-				Alert(
-					title: Text("An error occurred"),
-					message: Text(self.error!.localizedDescription),
-					dismissButton: .default(Text("OK")))
-			}
-			.alert(isPresented: $showSuccess) {
-				Alert(
-					title: Text("Custom configuration saved"),
-					message: Text(
-						"The configuration file has been saved in the application folder."),
-					dismissButton: .default(Text("OK")))
+			.alert(isPresented: Binding.isNotNil($showAlert)) {
+				switch self.showAlert {
+				case .error(let error):
+					Alert(
+						title: Text("An error occurred"),
+						message: Text(error.localizedDescription),
+						dismissButton: .default(Text("OK")))
+				case .success:
+					Alert(
+						title: Text("Custom configuration saved"),
+						message: Text(
+							"The configuration file has been saved in the application folder."),
+						dismissButton: .default(Text("OK")))
+				case .none:
+					Alert(title: Text("An error occurred"))
+				}
 			}
 		}
 	}
@@ -205,101 +205,6 @@ struct TotalStatisticsView: View {
 	}
 #endif
 
-private struct DatabaseMaintenanceView: View {
-	@Environment(AppState.self) private var appState
-	@State private var hasMigratedLegacyDatabase = false
-	@State private var hasLegacyDatabase = false
-	@State private var performingDatabaseMaintenance = false
-
-	var body: some View {
-		Form {
-			Section {
-				LabeledContent("Database type") {
-					if hasLegacyDatabase {
-						// This shouldn't happen because either the migration fails or the app runs, but if it does happen
-						// we want to know (and therefore indicate it in the UI).
-						Text("v1").foregroundStyle(.red)
-					}
-					else {
-						Text("v2")
-					}
-				}
-
-				if appState.userSettings.migratedToV2At > 0.0 {
-					LabeledContent("Upgraded at") {
-						Text(
-							Date(timeIntervalSinceReferenceDate: appState.userSettings.migratedToV2At).formatted(
-								date: .abbreviated, time: .shortened))
-					}
-				}
-			}
-
-			if hasLegacyDatabase {
-				Section {
-					Button("Restart app to remove v1 database") {
-						UserDefaults.standard.set(true, forKey: "clearV1Index")
-						exit(0)
-					}
-					#if os(macOS)
-						.buttonStyle(.link)
-					#endif
-				} footer: {
-					Text(
-						"A legacy database is still present. If the app is functioning correctly, it is safe to manually delete this database. In order to do this, the app needs to be restarted."
-					)
-				}.disabled(performingDatabaseMaintenance)
-			}
-
-			if hasMigratedLegacyDatabase {
-				Section {
-					Button("Remove v1 database back-up") {
-						self.clearMigratedLegacyDatabase()
-					}
-					#if os(macOS)
-						.buttonStyle(.link)
-					#endif
-				} footer: {
-					Text(
-						"After a database upgrade, a copy of the old version is retained for a while. This copy may take up a significant amount of storage space. If everything is working as expected, it is safe to remove this back-up."
-					)
-				}.disabled(performingDatabaseMaintenance)
-			}
-		}
-		#if os(macOS)
-			.formStyle(.grouped)
-		#endif
-		.task {
-			self.updateDatabaseInfo()
-		}
-		.navigationTitle("Database maintenance")
-		#if os(iOS)
-			.navigationBarTitleDisplayMode(.inline)
-		#endif
-	}
-
-	private func updateDatabaseInfo() {
-		self.hasLegacyDatabase = appState.client.hasLegacyDatabase()
-		self.hasMigratedLegacyDatabase = appState.client.hasMigratedLegacyDatabase()
-	}
-
-	private func clearMigratedLegacyDatabase() {
-		if self.performingDatabaseMaintenance {
-			return
-		}
-		Task {
-			self.performingDatabaseMaintenance = true
-			do {
-				try appState.client.clearMigratedLegacyDatabase()
-			}
-			catch {
-				print("Cannot clear migrated V1 index: \(error.localizedDescription)")
-			}
-			self.updateDatabaseInfo()
-			self.performingDatabaseMaintenance = false
-		}
-	}
-}
-
 struct AdvancedSettingsView: View {
 	@Environment(AppState.self) private var appState
 	@ObservedObject var userSettings: AppUserSettings
@@ -310,9 +215,11 @@ struct AdvancedSettingsView: View {
 	@State private var folders: [SushitrainFolder] = []
 	@State private var confirmClearThumbnailCache = false
 
+	@State private var updateCounter = 0  // Used to force update after binding set... ugly
+
 	#if os(macOS)
 		@State private var showConfigurationSettings = false
-		@State private var showDatabaseMaintenance = false
+		@State private var showTroubleshooting = false
 	#endif
 
 	var body: some View {
@@ -326,6 +233,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { listening in
 							try? appState.client.setListening(listening)
+							self.updateCounter += 1
 						}))
 
 				// Listening addresses popup sheet
@@ -340,15 +248,11 @@ struct AdvancedSettingsView: View {
 					NavigationStack {
 						AsyncAddressesView(addressType: .listening)
 							.navigationTitle("Listening addresses")
-							.toolbar(content: {
-								ToolbarItem(
-									placement: .confirmationAction,
-									content: {
-										Button("Done") {
-											showListeningAddresses = false
-										}
-									})
-							})
+							.toolbar {
+								SheetButton(role: .save) {
+									showListeningAddresses = false
+								}
+							}
 					}
 				}
 			} header: {
@@ -391,6 +295,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setLocalAnnounceEnabled(nv)
+							self.updateCounter += 1
 						}))
 
 				Toggle(
@@ -401,6 +306,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setAnnounceLANAddresses(nv)
+							self.updateCounter += 1
 						}))
 
 				Toggle(
@@ -411,6 +317,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setGlobalAnnounceEnabled(nv)
+							self.updateCounter += 1
 						}))
 
 				// Global announce addresses popup sheet
@@ -421,15 +328,11 @@ struct AdvancedSettingsView: View {
 					NavigationStack {
 						AsyncAddressesView(addressType: .discovery)
 							.navigationTitle("Global announce servers")
-							.toolbar(content: {
-								ToolbarItem(
-									placement: .confirmationAction,
-									content: {
-										Button("Done") {
-											showDiscoveryAddresses = false
-										}
-									})
-							})
+							.toolbar {
+								SheetButton(role: .save) {
+									showDiscoveryAddresses = false
+								}
+							}
 					}
 				}
 				.disabled(!appState.client.isGlobalAnnounceEnabled())
@@ -447,6 +350,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setRelaysEnabled(nv)
+							self.updateCounter += 1
 						}))
 
 				Toggle(
@@ -457,6 +361,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setNATEnabled(nv)
+							self.updateCounter += 1
 						}))
 
 				Toggle(
@@ -467,6 +372,7 @@ struct AdvancedSettingsView: View {
 						},
 						set: { nv in
 							try? appState.client.setSTUNEnabled(nv)
+							self.updateCounter += 1
 						}))
 
 				// STUN server addresses popup sheet
@@ -477,15 +383,11 @@ struct AdvancedSettingsView: View {
 					NavigationStack {
 						AsyncAddressesView(addressType: .stun)
 							.navigationTitle("STUN servers")
-							.toolbar(content: {
-								ToolbarItem(
-									placement: .confirmationAction,
-									content: {
-										Button("Done") {
-											showSTUNAddresses = false
-										}
-									})
-							})
+							.toolbar {
+								SheetButton(role: .save) {
+									showSTUNAddresses = false
+								}
+							}
 					}
 				}
 				.disabled(!appState.client.isNATEnabled())
@@ -542,35 +444,6 @@ struct AdvancedSettingsView: View {
 				self.cacheText
 			}
 
-			Section {
-				Toggle("Enable debug logging", isOn: userSettings.$loggingToFileEnabled)
-			} header: {
-				Text("Logging")
-			} footer: {
-				if appState.userSettings.loggingToFileEnabled {
-					if appState.isLoggingToFile {
-						Text(
-							"The app is logging to a file in the application folder, which you can share with the developers."
-						)
-					}
-					else {
-						Text(
-							"After restarting the app, the app will write a log file in the application folder, which you can then share with the developers."
-						)
-					}
-				}
-				else {
-					if appState.isLoggingToFile {
-						Text("Restart the app to stop logging.")
-					}
-					else {
-						Text(
-							"Logging slows down the app and uses more battery. Only enable it if you are experiencing problems."
-						)
-					}
-				}
-			}
-
 			#if os(iOS)
 				Section {
 					ExportButtonView()
@@ -585,22 +458,18 @@ struct AdvancedSettingsView: View {
 
 			#if os(macOS)
 				Section {
-					Button("Database maintenance") {
-						self.showDatabaseMaintenance = true
+					Button("Troubleshooting") {
+						self.showTroubleshooting = true
 					}
 				}.buttonStyle(.link)
-					.sheet(isPresented: $showDatabaseMaintenance) {
+					.sheet(isPresented: $showTroubleshooting) {
 						NavigationStack {
-							DatabaseMaintenanceView()
-								.toolbar(content: {
-									ToolbarItem(
-										placement: .confirmationAction,
-										content: {
-											Button("Close") {
-												showDatabaseMaintenance = false
-											}
-										})
-								})
+							TroubleshootingView(userSettings: userSettings)
+								.toolbar {
+									SheetButton(role: .done) {
+										showTroubleshooting = false
+									}
+								}
 						}
 					}
 
@@ -611,19 +480,15 @@ struct AdvancedSettingsView: View {
 				}.buttonStyle(.link)
 					.sheet(isPresented: $showConfigurationSettings) {
 						ConfigurationSettingsView()
-							.toolbar(content: {
-								ToolbarItem(
-									placement: .confirmationAction,
-									content: {
-										Button("Close") {
-											showConfigurationSettings = false
-										}
-									})
-							})
+							.toolbar {
+								SheetButton(role: .done) {
+									showConfigurationSettings = false
+								}
+							}
 					}
 			#else
-				NavigationLink(destination: DatabaseMaintenanceView()) {
-					Text("Database maintenance")
+				NavigationLink(destination: TroubleshootingView(userSettings: userSettings)) {
+					Label("Troubleshooting", systemImage: "book.and.wrench")
 				}
 			#endif
 		}
@@ -632,6 +497,10 @@ struct AdvancedSettingsView: View {
 		}
 		.onDisappear {
 			appState.applySettings()
+		}
+		// This needs to be here to make sure the view refreshes after changing something
+		.onChange(of: self.updateCounter) { _, _ in
+			Log.info("Update counter changed")
 		}
 		.navigationTitle("Advanced settings")
 		#if os(macOS)
@@ -762,18 +631,18 @@ struct AdvancedSettingsView: View {
 
 				Section("Last background synchronization") {
 					if let lastSyncRun = self.appState.backgroundManager.lastBackgroundSyncRun {
-						Text("Started").badge(
-							lastSyncRun.started.formatted(
-								date: .abbreviated, time: .shortened))
+						Text("Started").badge(lastSyncRun.started.formatted(date: .abbreviated, time: .shortened))
 
 						if let lastSyncEnded = lastSyncRun.ended {
-							Text("Ended").badge(
-								lastSyncEnded.formatted(
-									date: .abbreviated, time: .shortened))
+							Text("Ended").badge(lastSyncEnded.formatted(date: .abbreviated, time: .shortened))
+
 							Text("Duration").badge(
-								durationFormatter.string(
-									from: lastSyncEnded.timeIntervalSince(
-										lastSyncRun.started)))
+								durationFormatter.string(from: lastSyncEnded.timeIntervalSince(lastSyncRun.started))
+							)
+
+							if let taskType = lastSyncRun.taskType {
+								Text("Type").badge(taskType.localizedTypeName)
+							}
 						}
 					}
 					else {
@@ -828,7 +697,10 @@ struct AdvancedSettingsView: View {
 
 		private func updateNotificationStatus() {
 			UNUserNotificationCenter.current().getNotificationSettings { settings in
-				self.authorizationStatus = settings.authorizationStatus
+				let authorizationStatus = settings.authorizationStatus
+				DispatchQueue.main.async {
+					self.authorizationStatus = authorizationStatus
+				}
 			}
 		}
 	}
@@ -1124,14 +996,20 @@ private struct BandwidthSettingsView: View {
 				}
 
 				Section {
-					NavigationLink("Statistics") {
-						TotalStatisticsView()
+					NavigationLink(destination: TotalStatisticsView()) {
+						Label("Statistics", systemImage: "chart.pie")
 					}
 				}
 
 				Section {
-					NavigationLink("About this app") {
-						AboutView()
+					#if os(iOS)
+						NavigationLink(destination: SupportView()) {
+							Label("Questions, support & feedback", systemImage: "lifepreserver")
+						}
+					#endif
+
+					NavigationLink(destination: AboutView()) {
+						Label("About this app", systemImage: "info.circle")
 					}
 				}
 			}

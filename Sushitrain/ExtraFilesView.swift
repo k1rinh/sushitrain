@@ -122,12 +122,21 @@ struct ExtraFilesView: View {
 						isPresented: $showApplyConfirmation,
 						titleVisibility: .visible
 					) {
-						Button("Delete \(deleteCount) files, keep \(keepCount) files", role: .destructive) {
-							Task { await self.apply() }
+						if deleteCount > 0 {
+							Button("Delete \(deleteCount) files, keep \(keepCount) files", role: .destructive) {
+								Task { await self.apply() }
+							}
+						}
+						else {
+							Button("Keep \(keepCount) files") {
+								Task { await self.apply() }
+							}
 						}
 					}
 				})
-		}.quickLookPreview(self.$localItemURL).alert(isPresented: Binding.constant(errorMessage != nil)) {
+		}
+		.quickLookPreview(self.$localItemURL)
+		.alert(isPresented: Binding.isNotNil($errorMessage)) {
 			Alert(
 				title: Text("An error occurred"), message: Text(errorMessage ?? ""),
 				dismissButton: .default(Text("OK")) { errorMessage = nil })

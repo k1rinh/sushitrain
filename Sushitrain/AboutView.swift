@@ -29,8 +29,6 @@ struct AboutView: View {
 						string:
 							"https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
 					)!)
-				Link("Frequently asked questions", destination: URL(string: "https://t-shaped.nl/synctrain-support")!)
-				Link("Ask a question", destination: URL(string: "https://github.com/pixelspark/sushitrain/discussions")!)
 			}
 
 			Section("Open source") {
@@ -76,9 +74,12 @@ struct AboutView: View {
 				Text("Syncthing").badge(SushitrainVersion())
 			}
 
-			Button("Show introduction screen") {
+			Button("Show introduction screen", systemImage: "hands.and.sparkles.fill") {
 				showOnboarding = true
 			}
+			#if os(macOS)
+				.buttonStyle(.link)
+			#endif
 		}
 		.navigationTitle("About this app")
 		#if os(iOS)
@@ -89,12 +90,12 @@ struct AboutView: View {
 		#endif
 		.sheet(isPresented: $showOnboarding) {
 			if #available(iOS 18, *) {
-				OnboardingView()
+				OnboardingView(allowSkip: true)
 					.interactiveDismissDisabled()
-					.presentationSizing(.form.fitted(horizontal: false, vertical: true))
+					.presentationSizing(.form.sticky())
 			}
 			else {
-				OnboardingView()
+				OnboardingView(allowSkip: true)
 					.interactiveDismissDisabled()
 			}
 		}
@@ -104,13 +105,9 @@ struct AboutView: View {
 				WebView(url: url, trustFingerprints: [], isLoading: Binding.constant(false), error: Binding.constant(nil))
 					.frame(minHeight: 480)
 					.toolbar {
-						ToolbarItem(
-							placement: .cancellationAction,
-							content: {
-								Button("Close") {
-									showNotices = false
-								}
-							})
+						SheetButton(role: .done) {
+							showNotices = false
+						}
 					}
 					.navigationTitle("Legal notices")
 					#if os(iOS)

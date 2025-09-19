@@ -13,9 +13,158 @@ struct DevicesView: View {
 		#if os(macOS)
 			DevicesGridView().navigationTitle("Devices")
 		#else
-			DevicesListView().navigationTitle("Devices")
+			DevicesListView(userSettings: appState.userSettings).navigationTitle("Devices")
 		#endif
+	}
+}
 
+private struct DeviceMetricView: View {
+	@Environment(AppState.self) private var appState
+
+	let device: SushitrainPeer
+	let metric: DeviceMetric
+
+	@State private var measurement: Double? = nil
+	@State private var address: String? = nil
+
+	static let formatter = ByteCountFormatter()
+
+	var body: some View {
+		self.metricView().foregroundStyle(.secondary)
+	}
+
+	@ViewBuilder private func metricView() -> some View {
+		ZStack {
+			switch self.metric {
+			case .none:
+				EmptyView()
+
+			case .shortID:
+				Text(self.device.shortDeviceID()).monospaced()
+
+			case .lastSeenAgo:
+				if let secondsAgo = self.measurement, !secondsAgo.isNaN {
+					Text(Duration.seconds(secondsAgo).formatted())
+				}
+				else {
+					EmptyView()
+				}
+
+			case .lastAddress:
+				if let la = self.address {
+					Text(la)
+				}
+				else {
+					EmptyView()
+				}
+
+			case .latency:
+				if let latency = self.measurement, !latency.isNaN {
+					LatencyView(latency: latency)
+				}
+				else {
+					EmptyView()
+				}
+			case .needBytes:
+				if let bytes = self.measurement, !bytes.isNaN {
+					Text(DeviceMetricView.formatter.string(fromByteCount: Int64(bytes)))
+				}
+				else {
+					EmptyView()
+				}
+			case .needItems:
+				if let items = self.measurement, !items.isNaN {
+					Text(items.formatted())
+				}
+				else {
+					EmptyView()
+				}
+
+			case .completionPercentage:
+				if let pct = self.measurement, !pct.isNaN {
+					Text("\(Int(pct))%")
+				}
+				else {
+					EmptyView()
+				}
+			}
+		}.task {
+			await self.update()
+		}
+		.onChange(of: self.metric) { _, _ in
+			self.measurement = nil
+			Task {
+				await self.update()
+			}
+		}
+	}
+
+	private func update() async {
+		(self.measurement, self.address) = await Task { @concurrent in
+			return await self.calculateMeasurement()
+		}.value
+	}
+
+	private nonisolated func calculateMeasurement() async -> (Double?, String?) {
+		let client = await appState.client
+
+		do {
+			switch self.metric {
+			case .latency:
+				return (client.measurements?.latency(for: self.device.deviceID()), nil)
+
+			case .lastAddress:
+				return (nil, client.getLastPeerAddress(self.device.deviceID()))
+
+			case .lastSeenAgo:
+				if let ls = device.lastSeen()?.date() {
+					return (Date.now.timeIntervalSince(ls), nil)
+				}
+				else {
+					return (nil, nil)
+				}
+
+			case .needBytes, .needItems, .completionPercentage:
+				if let folders = device.sharedFolderIDs()?.asArray() {
+					var total: Int64 = 0
+					var totalPercentage: Double = 100.0
+					for folderID in folders {
+						if let folder = client.folder(withID: folderID) {
+							let stats = try folder.completion(forDevice: self.device.deviceID())
+							if self.metric == .needBytes {
+								total += stats.needBytes
+							}
+							else if self.metric == .needItems {
+								total += Int64(stats.needItems)
+							}
+							else if self.metric == .completionPercentage {
+								totalPercentage *= stats.completionPct / 100.0
+							}
+						}
+					}
+
+					if self.metric == .needBytes || self.metric == .needItems {
+						return (Double(total), nil)
+					}
+					else if self.metric == .completionPercentage {
+						return (totalPercentage, nil)
+					}
+					else {
+						return (nil, nil)
+					}
+				}
+				else {
+					return (nil, nil)
+				}
+
+			case .none, .shortID:
+				return (nil, nil)
+			}
+		}
+		catch {
+			Log.warn("error getting device metrics: \(error.localizedDescription)")
+			return (nil, nil)
+		}
 	}
 }
 
@@ -46,6 +195,54 @@ struct LatencyView: View {
 }
 
 #if os(iOS)
+	struct DeviceMetricPickerView: View {
+		@ObservedObject var userSettings: AppUserSettings
+
+		var body: some View {
+			Picker("Show metric", selection: self.userSettings.$devicesViewMetric) {
+				HStack {
+					Text("None")
+				}.tag(DeviceMetric.none)
+
+				HStack {
+					Image(systemName: "cellularbars")
+					Text("Latency")
+				}.tag(DeviceMetric.latency)
+
+				HStack {
+					Image(systemName: "number.circle.fill")
+					Text("Needs (size)")
+				}.tag(DeviceMetric.needBytes)
+
+				HStack {
+					Image(systemName: "number.circle.fill")
+					Text("Needs (items)")
+				}.tag(DeviceMetric.needItems)
+
+				HStack {
+					Image(systemName: "percent")
+					Text("Completion percentage")
+				}.tag(DeviceMetric.completionPercentage)
+
+				HStack {
+					Image(systemName: "qrcode")
+					Text("Device ID")
+				}.tag(DeviceMetric.shortID)
+
+				HStack {
+					Image(systemName: "timer")
+					Text("Last seen (ago)")
+				}.tag(DeviceMetric.lastSeenAgo)
+
+				HStack {
+					Image(systemName: "envelope.front")
+					Text("Address")
+				}.tag(DeviceMetric.lastAddress)
+			}
+			.pickerStyle(.inline)
+		}
+	}
+
 	private struct DevicesListView: View {
 		@Environment(AppState.self) private var appState
 		@State private var showingAddDevicePopup = false
@@ -53,7 +250,8 @@ struct LatencyView: View {
 		@State private var discoveredNewDevices: [String] = []
 		@State private var peers: [SushitrainPeer] = []
 		@State private var loading = true
-		@State private var measurements: [String: Double] = [:]
+
+		@ObservedObject var userSettings: AppUserSettings
 
 		var body: some View {
 			List {
@@ -86,11 +284,8 @@ struct LatencyView: View {
 									}
 
 									Spacer()
-									if peer.isConnected() {
-										if let latency = self.measurements[peer.deviceID()], !latency.isNaN {
-											LatencyView(latency: latency)
-										}
-									}
+
+									DeviceMetricView(device: peer, metric: userSettings.devicesViewMetric)
 								}
 							}
 						}.onDelete(perform: { indexSet in
@@ -113,20 +308,33 @@ struct LatencyView: View {
 
 				// Add peer manually
 				Section {
-					Button(
-						"Add device...", systemImage: "plus",
-						action: {
-							addingDeviceID = ""
-							showingAddDevicePopup = true
-						}
-					)
+					Button("Add device...", systemImage: "plus") {
+						addingDeviceID = ""
+						showingAddDevicePopup = true
+					}
 					#if os(macOS)
 						.buttonStyle(.borderless)
 					#endif
 				}
 			}
 			#if os(iOS)
-				.toolbar { if !peers.isEmpty { EditButton() } }
+				.toolbar {
+					ToolbarItem {
+						EditButton().disabled(peers.isEmpty)
+					}
+
+					ToolbarItem {
+						Menu(
+							content: {
+								DeviceMetricPickerView(userSettings: appState.userSettings)
+							},
+							label: {
+								Image(systemName: "ellipsis.circle")
+									.accessibilityLabel(Text("Menu"))
+							}
+						)
+					}
+				}
 			#endif
 			.sheet(isPresented: $showingAddDevicePopup) {
 				AddDeviceView(suggestedDeviceID: $addingDeviceID)
@@ -142,17 +350,6 @@ struct LatencyView: View {
 				let measurements = appState.client.measurements
 				Task.detached {
 					measurements?.measure()
-					await self.updateMeasurements()
-				}
-			}
-		}
-
-		private func updateMeasurements() {
-			// Measurements
-			self.measurements = [:]
-			if let m = appState.client.measurements {
-				for device in self.peers {
-					self.measurements[device.deviceID()] = m.latency(for: device.deviceID())
 				}
 			}
 		}
@@ -160,7 +357,6 @@ struct LatencyView: View {
 		private func update() async {
 			self.loading = true
 			self.peers = await appState.peers().filter({ x in !x.isSelf() }).sorted()
-			self.updateMeasurements()
 
 			// Discovered peers
 			let peerIDs = peers.map { $0.deviceID() }
@@ -220,7 +416,7 @@ struct LatencyView: View {
 
 						TableColumnForEach(self.peers) { peer in
 							TableColumn(peer.displayName) { folder in
-								DevicesGridCellView(device: peer, folder: folder, viewStyle: viewStyle)
+								DevicesGridCellView(appState: appState, device: peer, folder: folder, viewStyle: viewStyle)
 									// Needed because for some reason SwiftUI doesn't propagate environment inside TableColumn
 									.environment(self.appState)
 							}.width(ideal: 50).alignment(.center)
@@ -362,7 +558,9 @@ struct LatencyView: View {
 									TableColumn("Last seen") { (row: DevicesGridRow) in
 										switch row {
 										case .connectedDevice(let device):
-											if let lastSeen = device.lastSeen(), !lastSeen.isZero() { Text(lastSeen.date().formatted()) }
+											if let lastSeen = device.lastSeen()?.date() {
+												Text(lastSeen.formatted())
+											}
 										case .discoveredDevice(_): EmptyView()
 										}
 									}.width(min: 100, ideal: 150).defaultVisibility(.hidden).customizationID("lastSeen")
@@ -373,7 +571,9 @@ struct LatencyView: View {
 								TableColumnForEach(self.folders) { folder in
 									TableColumn(folder.displayName) { (row: DevicesGridRow) in
 										if case .connectedDevice(let peer) = row {
-											DevicesGridCellView(device: peer, folder: folder, viewStyle: viewStyle)
+											DevicesGridCellView(appState: self.appState, device: peer, folder: folder, viewStyle: viewStyle)
+												// Needed because for some reason SwiftUI doesn't propagate environment inside TableColumn
+												.environment(self.appState)
 										}
 										else {
 											EmptyView()
@@ -412,11 +612,7 @@ struct LatencyView: View {
 			.task {
 				await self.update()
 			}
-			.navigationDestination(
-				isPresented: Binding(
-					get: { self.openedDevice != nil },
-					set: { self.openedDevice = $0 ? self.openedDevice : nil })
-			) {
+			.navigationDestination(isPresented: Binding.isNotNil($openedDevice)) {
 				self.nextView()
 			}
 			.toolbar {
@@ -523,7 +719,7 @@ struct LatencyView: View {
 	}
 
 	private struct DevicesGridCellView: View {
-		@Environment(AppState.self) private var appState
+		var appState: AppState
 		var device: SushitrainPeer
 		var folder: SushitrainFolder
 		var viewStyle: GridViewStyle
@@ -567,8 +763,8 @@ struct LatencyView: View {
 				}
 			}
 			.contextMenu {
-				Button(action: { self.showEditEncryptionPassword = true }) {
-					Text("Show info...")
+				Button("Show info...") {
+					self.showEditEncryptionPassword = true
 				}
 			}
 			.task {
@@ -608,7 +804,7 @@ struct LatencyView: View {
 				self.loadingTask = nil
 			}
 
-			self.loadingTask = Task.detached(priority: .userInitiated) {
+			self.loadingTask = Task(priority: .userInitiated) { @concurrent in
 				dispatchPrecondition(condition: .notOnQueue(.main))
 				let sharedWithDeviceIDs = folder.sharedWithDeviceIDs()?.asArray() ?? []
 				let sharedEncrypted = folder.sharedEncryptedWithDeviceIDs()?.asArray() ?? []

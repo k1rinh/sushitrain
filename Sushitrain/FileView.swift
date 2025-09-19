@@ -28,6 +28,7 @@ struct FileView: View {
 	@State private var openWithAppURL: URL? = nil
 	@State private var localPath: String? = nil
 	@State private var showArchive: Bool = false
+	@State private var subdirectorySizeBytes: Int64? = nil
 
 	@Environment(AppState.self) private var appState
 	@Environment(\.dismiss) private var dismiss
@@ -58,6 +59,10 @@ struct FileView: View {
 				Section {
 					if !file.isDirectory() && !file.isSymlink() {
 						Text("File size").badge(Self.formatter.string(fromByteCount: file.size()))
+					}
+
+					if let subDirSize = self.subdirectorySizeBytes, file.isDirectory() {
+						Text("Subdirectory size").badge(Self.formatter.string(fromByteCount: subDirSize))
 					}
 
 					if let md = file.modifiedAt()?.date(), !file.isSymlink() {
@@ -291,6 +296,10 @@ struct FileView: View {
 				self.downloaderSheet()
 			}
 
+			.sheet(isPresented: $showEncryptionSheet) {
+				EncryptionView(entry: self.file)
+			}
+
 			.toolbar {
 				// Next/previous buttons
 				if let selfIndex = selfIndex, let siblings = siblings {
@@ -304,8 +313,8 @@ struct FileView: View {
 				}
 
 				#if os(macOS)
-					// Menu for advanced actions
-					ToolbarItem {
+					ToolbarItemGroup(placement: .primaryAction) {
+						// Menu for advanced actions
 						Menu {
 							Button("Encryption details...", systemImage: "lock.document.fill") { showEncryptionSheet = true }
 								.disabled(!(file.folder?.hasEncryptedPeers ?? false))
@@ -314,10 +323,8 @@ struct FileView: View {
 						} label: {
 							Label("Advanced", systemImage: "ellipsis.circle")
 						}
-					}
 
-					// Open in Finder button
-					ToolbarItem(id: "open-in-finder", placement: .primaryAction) {
+						// Open in Finder button
 						Button(
 							openInFilesAppLabel, systemImage: "arrow.up.forward.app",
 							action: {
@@ -328,12 +335,12 @@ struct FileView: View {
 				#endif
 			}
 
-			.sheet(isPresented: $showEncryptionSheet) {
-				EncryptionView(entry: self.file)
-			}
-
 			.onAppear {
 				selfIndex = self.siblings?.firstIndex(of: file)
+			}
+
+			.task {
+				await self.update()
 			}
 
 			.onChange(of: file, initial: true) { _, _ in
@@ -345,6 +352,24 @@ struct FileView: View {
 				self.update()
 			}
 		}
+	}
+
+	private func update() async {
+		self.subdirectorySizeBytes = nil
+		let file = self.file
+		self.subdirectorySizeBytes = await Task.detached {
+			if file.isDirectory() {
+				var size: Int64 = 0
+				do {
+					try file.recursiveSize(&size)
+					return size
+				}
+				catch {
+					Log.warn("could not calculate subdirectory size: \(error.localizedDescription)")
+				}
+			}
+			return nil
+		}.value
 	}
 
 	@ViewBuilder private func zipButton() -> some View {
@@ -362,13 +387,9 @@ struct FileView: View {
 				ZipView(archive: ar, prefix: "")
 					.navigationTitle(file.fileName())
 					.toolbar {
-						ToolbarItem(
-							placement: .cancellationAction,
-							content: {
-								Button("Close") {
-									showArchive = false
-								}
-							})
+						SheetButton(role: .done) {
+							showArchive = false
+						}
 					}
 			}
 			else {
@@ -383,9 +404,11 @@ struct FileView: View {
 				#if os(iOS)
 					.navigationBarTitleDisplayMode(.inline)
 				#endif
-				.toolbar(content: {
-					ToolbarItem(placement: .cancellationAction, content: { Button("Cancel") { showDownloader = false } })
-				})
+				.toolbar {
+					SheetButton(role: .cancel) {
+						showDownloader = false
+					}
+				}
 		}
 	}
 
@@ -525,7 +548,7 @@ struct FileView: View {
 				self.fullyAvailableOnDevices = availability.flatMap { devID in
 					if let p = self.appState.client.peer(withID: devID) { return [p] }
 					return []
-				}
+				}.sorted(by: { $0.displayName < $1.displayName })
 			}
 			catch {
 				self.availabilityError = error

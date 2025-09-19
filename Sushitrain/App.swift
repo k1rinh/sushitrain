@@ -12,6 +12,7 @@ import AppIntents
 @main
 struct SushitrainApp: App {
 	@State fileprivate var appState: AppState
+
 	fileprivate var delegate: SushitrainDelegate?
 	private let qaService = QuickActionService.shared
 
@@ -75,6 +76,7 @@ struct SushitrainApp: App {
 			let hideInDock = self.hideInDock
 		#endif
 
+		// Check if we need to show onboarding
 		Task {
 			await appState.start()
 		}
@@ -86,7 +88,7 @@ struct SushitrainApp: App {
 		#endif
 	}
 
-	private static func configDirectoryURL() -> URL {
+	static func configDirectoryURL() -> URL {
 		// Determine the config directory (on macOS the user can choose a directory)
 		var isCustom = false
 		#if os(macOS)
@@ -140,14 +142,7 @@ struct SushitrainApp: App {
 
 	private func onReceiveMemoryWarning() {
 		Log.info("Received memory pressure warning")
-		ImageCache.clearMemoryCache()
-
-		Task {
-			try? await goTask {
-				SushitrainClearBlockCache()
-				SushitrainTriggerGC()
-			}
-		}
+		self.appState.reduceMemoryUsage()
 	}
 
 	var body: some Scene {
@@ -188,31 +183,29 @@ struct SushitrainApp: App {
 				NSApp.activate(ignoringOtherApps: true)
 			}
 			.commands {
+				CommandGroup(after: .sidebar) {
+					Toggle("Hide dotfiles", isOn: appState.userSettings.$dotFilesHidden)
+				}
+
+				CommandGroup(replacing: CommandGroupPlacement.help) {
+					Button("Questions, support & feedback...") {
+						openWindow(id: "support")
+					}
+				}
+
 				CommandGroup(replacing: CommandGroupPlacement.appInfo) {
-					Button(
-						action: {
-							// Open the "about" window
-							openWindow(id: "about")
-						},
-						label: {
-							Text("About Synctrain")
-						})
+					Button("About Synctrain") {
+						// Open the "about" window
+						openWindow(id: "about")
+					}
 
-					Button(
-						action: {
-							openWindow(id: "stats")
-						},
-						label: {
-							Text("Statistics...")
-						})
+					Button("Statistics...") {
+						openWindow(id: "stats")
+					}
 
-					Button(
-						action: {
-							openWindow(id: "decrypter")
-						},
-						label: {
-							Text("Decrypt a folder...")
-						})
+					Button("Decrypt a folder...") {
+						openWindow(id: "decrypter")
+					}
 				}
 			}
 			.defaultLaunchBehavior(hideInDock ? .suppressed : .presented)
@@ -224,6 +217,14 @@ struct SushitrainApp: App {
 			// About window
 			Window("About Synctrain", id: "about") {
 				AboutView().environment(appState)
+			}
+			.windowResizability(.contentSize)
+
+			// Support window
+			Window("Questions, support & feedback", id: "support") {
+				NavigationStack {
+					SupportView()
+				}.environment(appState)
 			}
 			.windowResizability(.contentSize)
 
@@ -263,7 +264,7 @@ struct SushitrainApp: App {
 		@State private var folders: [SushitrainFolder] = []
 
 		var body: some Scene {
-			Window("Settings", id: "appSettings") {
+			Window("Settings...", id: "appSettings") {
 				NavigationStack {
 					TabbedSettingsView(hideInDock: $hideInDock)
 				}
@@ -276,7 +277,7 @@ struct SushitrainApp: App {
 							await self.update()
 						}
 
-					Button("Open file browser...") {
+					Button("Open file browser...", systemImage: "macwindow") {
 						openWindow(id: "singleMain")
 						NSApplication.shared.activate()
 					}
@@ -295,35 +296,23 @@ struct SushitrainApp: App {
 
 					Divider()
 
-					Button(
-						action: {
-							// Open the "about" window
-							openWindow(id: "appSettings")
-							NSApplication.shared.activate()
-						},
-						label: {
-							Text("Settings...")
-						})
+					Button("Settings", systemImage: "gear") {
+						// Open the "about" window
+						openWindow(id: "appSettings")
+						NSApplication.shared.activate()
+					}
 
-					Button(
-						action: {
-							openWindow(id: "stats")
-							NSApplication.shared.activate()
-						},
-						label: {
-							Text("Statistics...")
-						})
+					Button("Statistics", systemImage: "chart.pie") {
+						openWindow(id: "stats")
+						NSApplication.shared.activate()
+					}
 				}
 
-				Button(
-					action: {
-						// Open the "about" window
-						openWindow(id: "about")
-						NSApplication.shared.activate()
-					},
-					label: {
-						Text("About...")
-					})
+				Button("About...", systemImage: "info.circle") {
+					// Open the "about" window
+					openWindow(id: "about")
+					NSApplication.shared.activate()
+				}
 
 				Divider()
 
@@ -331,7 +320,7 @@ struct SushitrainApp: App {
 					Label("Hide in dock", systemImage: "eye.slash")
 				}
 
-				Button("Quit Synctrain") {
+				Button("Quit Synctrain", systemImage: "multiply.circle") {
 					NSApplication.shared.terminate(nil)
 				}
 			}

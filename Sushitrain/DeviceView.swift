@@ -27,13 +27,11 @@ private struct DeviceAddressesView: View {
 			.onDisappear {
 				self.write()
 			}
-			.alert(
-				isPresented: Binding(get: { self.error != nil }, set: { show in self.error = show ? self.error : nil }),
-				content: {
-					Alert(
-						title: Text("Could not change addresses"), message: Text(self.error ?? ""),
-						dismissButton: .default(Text("OK")))
-				})
+			.alert(isPresented: Binding.isNotNil($error)) {
+				Alert(
+					title: Text("Could not change addresses"), message: Text(self.error ?? ""),
+					dismissButton: .default(Text("OK")))
+			}
 	}
 
 	private func update() async {
@@ -69,8 +67,8 @@ struct DeviceView: View {
 					}
 					else {
 						Label("Not connected", systemImage: "xmark.circle")
-						if let lastSeen = device.lastSeen(), !lastSeen.isZero() {
-							Text("Last seen").badge(Text(lastSeen.date().formatted()))
+						if let lastSeen = device.lastSeen()?.date() {
+							Text("Last seen").badge(Text(lastSeen.formatted()))
 						}
 					}
 				}
@@ -154,24 +152,28 @@ struct DeviceView: View {
 					}
 				}
 
+				Section("Other settings") {
+					Toggle(
+						"Warn when device has not connected for a while",
+						isOn: Binding(
+							get: {
+								return !appState.userSettings.ignoreLongTimeNoSeeDevices.contains(self.device.deviceID())
+							},
+							set: { nv in
+								if nv {
+									appState.userSettings.ignoreLongTimeNoSeeDevices.remove(self.device.deviceID())
+								}
+								else {
+									appState.userSettings.ignoreLongTimeNoSeeDevices.insert(self.device.deviceID())
+								}
+							}))
+				}
+
 				if !lastAddress.isEmpty {
 					Section("Current addresses") {
 						Label(lastAddress, systemImage: "network").contextMenu {
-							Button(action: {
-								#if os(iOS)
-									UIPasteboard.general.string = lastAddress
-								#endif
-
-								#if os(macOS)
-									let pasteboard = NSPasteboard.general
-									pasteboard.clearContents()
-									pasteboard.prepareForNewContents()
-									pasteboard.setString(
-										lastAddress, forType: .string)
-								#endif
-							}) {
-								Text("Copy to clipboard")
-								Image(systemName: "doc.on.doc")
+							Button("Copy to clipboard", systemImage: "doc.on.doc") {
+								writeTextToPasteboard(lastAddress)
 							}
 						}
 					}
@@ -192,13 +194,10 @@ struct DeviceView: View {
 				}
 
 				Section {
-					Button(
-						"Unlink device", systemImage: "trash", role: .destructive,
-						action: {
-							try? device.remove()
-							dismiss()
-						}
-					)
+					Button("Unlink device", systemImage: "trash", role: .destructive) {
+						try? device.remove()
+						dismiss()
+					}
 					.foregroundColor(.red)
 					#if os(macOS)
 						.buttonStyle(.link)

@@ -64,7 +64,7 @@ struct ShareFolderWithDeviceDetailsView: View {
 			#if os(iOS)
 				.navigationBarTitleDisplayMode(.inline)
 			#endif
-			.toolbar(content: {
+			.toolbar {
 				ToolbarItem(
 					placement: .confirmationAction,
 					content: {
@@ -80,19 +80,13 @@ struct ShareFolderWithDeviceDetailsView: View {
 							}
 						}
 					})
-				ToolbarItem(
-					placement: .cancellationAction,
-					content: {
-						Button("Cancel") {
-							dismiss()
-						}
-					})
-			})
+
+				SheetButton(role: .cancel) {
+					dismiss()
+				}
+			}
 		}
-		.alert(
-			isPresented: Binding(
-				get: { self.error != nil }, set: { nv in self.error = nv ? self.error : nil })
-		) {
+		.alert(isPresented: Binding.isNotNil($error)) {
 			Alert(title: Text("Could not set encryption key"), message: Text(self.error!))
 		}
 	}
@@ -174,7 +168,7 @@ struct FolderStatusDescription {
 							)
 						}
 						// Error message is "fcntl /private/...: too many open files"
-						else if folder.isWatcherEnabled() && status.contains("too many open files") {
+						else if let err = error, folder.isWatcherEnabled() && err.localizedDescription.contains("too many open files") {
 							(self.text, self.systemImage, self.color) = (
 								String(localized: "Folder too large for watching"), "exclamationmark.triangle.fill", .red
 							)
@@ -208,44 +202,63 @@ struct FolderStatusView: View {
 	@Environment(AppState.self) private var appState
 	var folder: SushitrainFolder
 
+	@State private var statistics: SushitrainFolderStats? = nil
+	@State private var status: String? = nil
+	@State private var folderStatusDescription: FolderStatusDescription? = nil
+
 	var body: some View {
-		var error: NSError? = nil
-		let status = folder.state(&error)
+		VStack {
+			if let status = status {
+				if status == "syncing" && !folder.isSelective() {
+					if let statistics = self.statistics, statistics.global!.bytes > 0 {
+						let formatter = ByteCountFormatter()
+						if let globalBytes = statistics.global?.bytes, let localBytes = statistics.local?.bytes {
+							let remainingText = formatter.string(fromByteCount: (globalBytes - localBytes))
 
-		if status == "syncing" && !folder.isSelective() {
-			if let statistics = try? folder.statistics(), statistics.global!.bytes > 0 {
-				let formatter = ByteCountFormatter()
-				if let globalBytes = statistics.global?.bytes, let localBytes = statistics.local?.bytes {
-					let remainingText = formatter.string(fromByteCount: (globalBytes - localBytes))
-
-					ProgressView(
-						value: Double(localBytes) / Double(globalBytes),
-						total: 1.0
-					) {
-						Label(
-							"Synchronizing...", systemImage: "bolt.horizontal.circle"
-						)
-						.foregroundStyle(.orange)
-						.badge(Text(remainingText))
-					}.tint(.orange)
+							ProgressView(
+								value: Double(localBytes) / Double(globalBytes),
+								total: 1.0
+							) {
+								Label(
+									"Synchronizing...", systemImage: "bolt.horizontal.circle"
+								)
+								.foregroundStyle(.orange)
+								.badge(Text(remainingText))
+							}.tint(.orange)
+						}
+						else {
+							self.statusLabel()
+						}
+					}
+					else {
+						self.statusLabel()
+					}
 				}
 				else {
 					self.statusLabel()
 				}
-			}
-			else {
-				self.statusLabel()
-			}
-		}
-		else {
-			self.statusLabel()
-		}
 
-		let folderStatus = FolderStatusDescription(folder)
-
-		if let txt = folderStatus.additionalText {
-			Text(txt).foregroundStyle(.red)
+				if let folderStatus = self.folderStatusDescription, let txt = folderStatus.additionalText {
+					Text(txt).foregroundStyle(.red)
+				}
+			}
+		}.task {
+			await Task.detached {
+				await self.update()
+			}.value
 		}
+		.onChange(of: appState.eventCounter) { _, _ in
+			Task.detached {
+				await self.update()
+			}
+		}
+	}
+
+	private func update() async {
+		var error: NSError? = nil
+		self.status = folder.state(&error)
+		self.statistics = try? folder.statistics()
+		self.folderStatusDescription = FolderStatusDescription(folder)
 	}
 
 	@ViewBuilder private func statusLabel() -> some View {
@@ -254,7 +267,7 @@ struct FolderStatusView: View {
 		#if os(iOS)
 			Label(folderStatus.text, systemImage: folderStatus.systemImage)
 				.foregroundStyle(folderStatus.color)
-				.badge(folderStatus.badge)
+				.badge(Text(folderStatus.badge).foregroundStyle(folderStatus.color))
 		#else
 			Label(folderStatus.fullText, systemImage: folderStatus.systemImage)
 				.foregroundStyle(folderStatus.color)
@@ -423,12 +436,9 @@ private struct ExternalFolderSectionView: View {
 					}
 				}
 			)
-			.alert(
-				isPresented: .constant(self.errorText != nil),
-				content: {
-					Alert(title: Text("Could not relink folder"), message: Text(errorText ?? ""), dismissButton: .default(Text("OK")))
-				}
-			)
+			.alert(isPresented: Binding.isNotNil($errorText)) {
+				Alert(title: Text("Could not relink folder"), message: Text(errorText ?? ""), dismissButton: .default(Text("OK")))
+			}
 		} footer: {
 			if isAccessible {
 				Text("This folder is not in the default location, and may belong to another app.")
@@ -533,12 +543,9 @@ struct ExternalFolderInaccessibleView: View {
 					}
 				}
 			)
-			.alert(
-				isPresented: .constant(self.errorText != nil),
-				content: {
-					Alert(title: Text("Could not relink folder"), message: Text(errorText ?? ""), dismissButton: .default(Text("OK")))
-				}
-			)
+			.alert(isPresented: Binding.isNotNil($errorText)) {
+				Alert(title: Text("Could not relink folder"), message: Text(errorText ?? ""), dismissButton: .default(Text("OK")))
+			}
 		}
 	}
 
@@ -571,13 +578,11 @@ struct ExternalFolderInaccessibleView: View {
 
 struct FolderView: View {
 	private enum ConfirmableAction {
-		case none
 		case unlinkFolder
 		case removeFolder
 
 		var message: String {
 			switch self {
-			case .none: return ""
 			case .removeFolder:
 				return String(
 					localized:
@@ -593,7 +598,6 @@ struct FolderView: View {
 
 		var buttonTitle: String {
 			switch self {
-			case .none: return ""
 			case .removeFolder: return String(localized: "Remove the folder and all files")
 			case .unlinkFolder: return String(localized: "Unlink the folder")
 			}
@@ -605,9 +609,10 @@ struct FolderView: View {
 	@Environment(\.dismiss) private var dismiss
 	@State private var isWorking = false
 	@State private var showAlert: ShowAlert? = nil
-	@State private var showConfirmable: ConfirmableAction = .none
+	@State private var showConfirmable: ConfirmableAction? = nil
 	@State private var advancedExpanded = false
 	@State private var possiblePeers: [SushitrainPeer] = []
+	@State private var unsupportedDataProtection = false
 
 	private enum ShowAlert: Identifiable {
 		case error(String)
@@ -623,6 +628,8 @@ struct FolderView: View {
 
 	func update() async {
 		self.possiblePeers = await appState.peers().sorted().filter({ d in !d.isSelf() })
+		self.unsupportedDataProtection =
+			self.folder.isRegularFolder && URL(fileURLWithPath: self.folder.path()).hasUnsupportedProtection()
 	}
 
 	var body: some View {
@@ -636,6 +643,15 @@ struct FolderView: View {
 				}
 				else if isExternal == true {
 					ExternalFolderSectionView(folder: folder)
+				}
+
+				if self.unsupportedDataProtection {
+					Section {
+						Label("Limited access", systemImage: "xmark.circle")
+							.foregroundStyle(.red)
+					} footer: {
+						Text("The selected folder is protected, and therefore cannot be accessed while the device is locked.")
+					}
 				}
 
 				Section {
@@ -730,14 +746,11 @@ struct FolderView: View {
 			#endif
 		}
 		.confirmationDialog(
-			showConfirmable.message,
-			isPresented: Binding(
-				get: { self.showConfirmable != .none },
-				set: { self.showConfirmable = $0 ? self.showConfirmable : .none }
-			),
-			titleVisibility: .visible
+			showConfirmable?.message ?? "", isPresented: Binding.isNotNil($showConfirmable), titleVisibility: .visible
 		) {
-			Button(showConfirmable.buttonTitle, role: .destructive, action: self.confirmedAction)
+			if let sc = showConfirmable {
+				Button(sc.buttonTitle, role: .destructive, action: self.confirmedAction)
+			}
 		}
 	}
 
@@ -1150,15 +1163,11 @@ private struct FolderThumbnailSettingsView: View {
 					#if os(iOS)
 						.navigationBarTitleDisplayMode(.inline)
 					#endif
-					.toolbar(content: {
-						ToolbarItem(
-							placement: .cancellationAction,
-							content: {
-								Button("Cancel") {
-									showGenerateThumbnails = false
-								}
-							})
-					})
+					.toolbar {
+						SheetButton(role: .cancel) {
+							showGenerateThumbnails = false
+						}
+					}
 			}
 		}
 	}
@@ -1272,7 +1281,7 @@ private struct FolderGenerateThumbnailsView: View {
 			}
 		}
 		.padding(30)
-		.alert(isPresented: Binding.constant(error != nil)) {
+		.alert(isPresented: Binding.isNotNil($error)) {
 			Alert(
 				title: Text("An error occurred"), message: Text(error!),
 				dismissButton: .default(Text("OK")) {
@@ -1290,62 +1299,16 @@ private struct FolderGenerateThumbnailsView: View {
 	private static let thumbnailInterval: TimeInterval = 1.0
 
 	private func generateFor(prefix: String?) async throws {
-		let ic = ImageCache.forFolder(self.folder)
-		let tg = FolderSettingsManager.shared.settingsFor(folderID: self.folder.folderID).thumbnailGeneration
-
-		// If thumbnails are written to a custom folder, also write thumbnails for local images
-		let forceCachingLocalFiles: Bool
-		switch tg {
-		case .global:
-			forceCachingLocalFiles = !appState.userSettings.cacheThumbnailsToFolderID.isEmpty
-		case .disabled:
-			forceCachingLocalFiles = false
-		case .deviceLocal:
-			forceCachingLocalFiles = false
-		case .inside(_):
-			forceCachingLocalFiles = true
-		}
-
-		// Iterate over this folder's entries
-		let files = try self.folder.list(prefix, directories: false, recurse: false)
-
-		for idx in 0..<files.count() {
-			let filePath = files.item(at: idx)
-			if Task.isCancelled {
-				Log.info("Thumbnail generate task cancelled")
-				return
-			}
-
-			let fullPath = (prefix ?? "") + "/" + filePath
-
-			if case .inside(path: let insidePath) = tg, fullPath.withoutStartingSlash.starts(with: insidePath) {
-				Log.info("Skipping file \(fullPath), inside thumbnail directory")
-				continue
-			}
-
-			if let file = try? self.folder.getFileInformation(fullPath) {
-				// Recurse into subdirectories (depth-first)
-				if file.isDirectory() {
-					try await self.generateFor(prefix: file.path())
-				}
-
-				// Generate thumbnail for files that are not locally present (otherwise QuickLook will manage it for us)
-				// except when we are writing to a custom thumbnail folder (this device can then generate thumbnails for
-				// another from local files)
-				if file.canThumbnail && (forceCachingLocalFiles || !file.isLocallyPresent()) {
-					let thumb = await ic.getThumbnail(file: file, forceCache: forceCachingLocalFiles)
-
-					if (-lastThumbnailTime.timeIntervalSinceNow) > Self.thumbnailInterval {
-						lastThumbnailTime = Date.now
-						self.lastThumbnail = thumb
-					}
+		let tg = FolderSettingsManager.shared.settingsFor(folderID: folder.folderID).thumbnailGeneration
+		try await generateThumbnailsFor(
+			folder: self.folder, prefix: prefix, userSettings: appState.userSettings, generation: tg,
+			callback: { thumb in
+				if (-lastThumbnailTime.timeIntervalSinceNow) > Self.thumbnailInterval {
+					lastThumbnailTime = Date.now
+					self.lastThumbnail = thumb
 				}
 				self.processedFiles += 1
-			}
-			else {
-				Log.warn("Could not get file entry for path \(filePath)")
-			}
-		}
+			})
 	}
 }
 
@@ -1447,6 +1410,20 @@ private struct AdvancedFolderSettingsView: View {
 
 				if !folder.isPhotoFolder {
 					Toggle(
+						"Keep conflicting versions",
+						isOn: Binding(
+							get: {
+								return folder.maxConflicts() != 0
+							},
+							set: { nv in
+								try? folder.setMaxConflicts(nv ? -1 : 0)
+							}))
+				}
+			}
+
+			if !folder.isPhotoFolder {
+				Section {
+					Toggle(
 						"Watch for changes",
 						isOn: Binding(get: { folder.isWatcherEnabled() }, set: { try? folder.setWatcherEnabled($0) }))
 
@@ -1471,16 +1448,12 @@ private struct AdvancedFolderSettingsView: View {
 							Text("Delay for processing changes (seconds)")
 						}
 					}
-
-					Toggle(
-						"Keep conflicting versions",
-						isOn: Binding(
-							get: {
-								return folder.maxConflicts() != 0
-							},
-							set: { nv in
-								try? folder.setMaxConflicts(nv ? -1 : 0)
-							}))
+				} footer: {
+					#if os(iOS)
+						Text(
+							"Because of limitations in iOS, watching for changes will only work for about 250 subdirectories in total across all folders. If you are experiencing issues, disable this setting for all folders."
+						)
+					#endif
 				}
 			}
 		}

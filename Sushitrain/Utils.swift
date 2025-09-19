@@ -54,7 +54,10 @@ extension SushitrainPeer {
 }
 
 extension SushitrainDate {
-	public func date() -> Date {
+	public func date() -> Date? {
+		if self.unixMilliseconds() == 0 {
+			return nil
+		}
 		return Date(timeIntervalSince1970: Double(self.unixMilliseconds()) / 1000.0)
 	}
 }
@@ -539,18 +542,6 @@ extension SushitrainFolder: @retroactive Identifiable {
 extension SushitrainChange: @retroactive Identifiable {
 }
 
-struct BackgroundSyncRun: Codable, Equatable {
-	var started: Date
-	var ended: Date?
-
-	var asString: String {
-		if let ended = self.ended {
-			return "\(self.started.formatted()) - \(ended.formatted())"
-		}
-		return self.started.formatted()
-	}
-}
-
 enum SushitrainEntryTransferableError: Error {
 	case notAvailable
 }
@@ -997,7 +988,7 @@ func writeTextToPasteboard(_ text: String) {
 
 // Run a possibly blocking task in the background (for calls into Go code)
 func goTask(_ block: @Sendable @escaping () async throws -> Void) async throws {
-	try await Task.detached {
+	try await Task { @concurrent in
 		dispatchPrecondition(condition: .notOnQueue(.main))
 		try await block()
 	}.value
@@ -1057,7 +1048,7 @@ struct EntryComparator: SortComparator {
 			case .size:
 				return .orderedSame  // Directories all have zero size
 			case .lastModifiedDate:
-				let r = compareDates(lhs.modifiedAt()?.date(), rhs.modifiedAt()?.date())
+				let r = compareDates(lhs.modifiedAt()?.date() ?? Date.distantPast, rhs.modifiedAt()?.date() ?? Date.distantPast)
 				return order == .forward ? r : r.flipped
 			case .name:
 				return order == .forward
@@ -1102,5 +1093,128 @@ struct EntryComparator: SortComparator {
 				}
 			}
 		}
+	}
+}
+
+extension URL {
+	// Checks if the target  has certain data protection mechanisms turned on that may
+	// disallow us from accessing the folder while the device is locked
+	func hasUnsupportedProtection() -> Bool {
+		#if os(iOS)
+			let unsupportedProtection = Set<URLFileProtection>([.complete, .completeWhenUserInactive])
+		#else
+			let unsupportedProtection = Set<URLFileProtection>([.complete])
+		#endif
+
+		do {
+			let rv = try self.resourceValues(forKeys: [.fileProtectionKey])
+			if let fp = rv.fileProtection {
+				Log.info("Data protection setting for \(path) is \(fp)")
+
+				if unsupportedProtection.contains(fp) {
+					Log.warn("Directory has unsupported data protection setting: \(fp) (\(path))")
+					return true
+				}
+			}
+		}
+		catch {
+			Log.warn("Could not obtain file protection status for url \(path): \(error)")
+		}
+		return false
+	}
+}
+
+extension FileManager {
+	nonisolated func sizeOfFolder(path: URL) async throws -> UInt {
+		let files = try self.subpathsOfDirectory(atPath: path.path(percentEncoded: false))
+		var totalSize: UInt = 0
+		for file in files {
+			let filePath = path.appendingPathComponent(file)
+			let fileDictionary = try self.attributesOfItem(atPath: filePath.path(percentEncoded: false))
+			if let size = fileDictionary[FileAttributeKey.size] as? UInt {
+				totalSize += size
+			}
+			else {
+				Log.warn("No file size for path \(filePath.path) \(file) \(fileDictionary)")
+			}
+		}
+		return totalSize
+	}
+}
+
+struct SheetButton: ToolbarContent {
+	enum SheetButtonRole {
+		case done
+		case cancel
+		case add
+		case save
+
+		@available(iOS 26.0, macOS 26.0, *)
+		var buttonRole: ButtonRole {
+			switch self {
+			case .done: return .close
+			case .cancel: return .cancel
+			case .add: return .confirm
+			case .save: return .confirm
+			}
+		}
+
+		var placement: ToolbarItemPlacement {
+			switch self {
+			case .add: return .confirmationAction
+			case .done: return .confirmationAction
+			case .cancel: return .cancellationAction
+			case .save: return .confirmationAction
+			}
+		}
+	}
+
+	#if os(iOS)
+		@Environment(\.editMode) private var editMode
+	#endif
+
+	let role: SheetButtonRole
+	var isDisabled: Bool = false
+	let action: () -> Void
+
+	var body: some ToolbarContent {
+		ToolbarItem(placement: self.role.placement) {
+			if #available(iOS 26.0, macOS 26.0, *) {
+				Button(role: self.role.buttonRole, action: self.action)
+					.disabled(self.isDisabled || self.inEditMode)
+			}
+			else {
+				self.legacyButton()
+					.disabled(self.isDisabled || self.inEditMode)
+			}
+		}
+	}
+
+	@ViewBuilder private func legacyButton() -> some View {
+		switch self.role {
+		case .save:
+			Button("Save", action: self.action)
+		case .done:
+			Button("Done", action: self.action)
+		case .cancel:
+			Button("Cancel", role: .cancel, action: self.action)
+		case .add:
+			Button("Add", action: self.action)
+		}
+	}
+
+	private var inEditMode: Bool {
+		#if os(macOS)
+			return false
+		#else
+			return editMode?.wrappedValue.isEditing ?? false
+		#endif
+	}
+}
+
+extension Binding where Value == Bool {
+	static func isNotNil<T: Sendable>(_ underlying: Binding<T?>) -> Binding<Bool> {
+		return Binding(
+			get: { underlying.wrappedValue != nil }, set: { underlying.wrappedValue = $0 ? underlying.wrappedValue : nil })
 	}
 }

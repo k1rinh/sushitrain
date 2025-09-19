@@ -16,6 +16,10 @@ struct MainView: View {
 		switch appState.startupState {
 		case .notStarted:
 			LoadingMainView(appState: appState)
+
+		case .onboarding:
+			OnboardingView(allowSkip: false)
+
 		case .error(let e):
 			ContentUnavailableView {
 				Label("Cannot start the app", systemImage: "exclamationmark.triangle.fill")
@@ -35,62 +39,97 @@ struct MainView: View {
 }
 
 private struct ContentView: View {
-	private static let currentOnboardingVersion = 1
-
 	@Environment(AppState.self) private var appState
-	@AppStorage("onboardingVersionShown") var onboardingVersionShown = 0
 	@Environment(\.scenePhase) var scenePhase
 	@Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
 	@State private var showCustomConfigWarning = false
-	@State private var showOnboarding = false
 	@State var route: Route? = .start
 	@State private var columnVisibility = NavigationSplitViewVisibility.doubleColumn
+	@State private var showSearchSheet = false
+	@State private var searchSheetSearchTerm: String = ""
 
-	#if os(iOS)
-		@State private var showSearchSheet = false
-		@State private var searchSheetSearchTerm: String = ""
-	#endif
+	@ViewBuilder private func foldersTab() -> some View {
+		NavigationStack {
+			FoldersView()
+				.toolbar {
+					Button(
+						openInFilesAppLabel, systemImage: "arrow.up.forward.app",
+						action: {
+							let documentsUrl = FileManager.default.urls(
+								for: .documentDirectory, in: .userDomainMask
+							).first!
+							openURLInSystemFilesApp(url: documentsUrl)
+						}
+					).labelStyle(.iconOnly)
+				}
+		}
+	}
 
-	var tabbedBody: some View {
+	// Legacy one has search as toolbar option at the top
+	@ViewBuilder private func legacyTabbedBody() -> some View {
 		TabView(selection: $route) {
 			// Me
 			NavigationStack {
 				StartOrSearchView(route: $route)
-			}
-			.tabItem {
+			}.tabItem {
 				Label("Start", systemImage: self.appState.syncState.systemImage)
 			}.tag(Route.start)
 
 			// Folders
-			NavigationStack {
-				FoldersView()
-					.toolbar {
-						Button(
-							openInFilesAppLabel, systemImage: "arrow.up.forward.app",
-							action: {
-								let documentsUrl = FileManager.default.urls(
-									for: .documentDirectory, in: .userDomainMask
-								).first!
-								openURLInSystemFilesApp(url: documentsUrl)
-							}
-						).labelStyle(.iconOnly)
-					}
-			}
-			.tabItem {
+			self.foldersTab().tabItem {
 				Label("Folders", systemImage: "folder.fill")
 			}.tag(Route.folder(folderID: nil))
 
 			// Peers
 			NavigationStack {
 				DevicesView()
-			}
-			.tabItem {
+			}.tabItem {
 				Label("Devices", systemImage: "externaldrive.fill")
 			}.tag(Route.devices)
 		}
 	}
 
-	var splitBody: some View {
+	// Modern one has the search as a tab
+	@available(iOS 26.0, *)
+	@ViewBuilder private func modernTabbedBody() -> some View {
+		TabView(selection: $route) {
+			Tab("Start", systemImage: self.appState.syncState.systemImage, value: Route.start) {
+				// Me
+				NavigationStack {
+					StartOrSearchView(route: $route)
+				}
+			}
+
+			// Folders
+			Tab("Folders", systemImage: "folder.fill", value: Route.folder(folderID: nil)) {
+				self.foldersTab()
+			}
+
+			// Peers
+			Tab("Devices", systemImage: "externaldrive.fill", value: Route.devices) {
+				NavigationStack {
+					DevicesView()
+				}
+			}
+
+			// Search (iOS 26)
+			Tab(value: Route.search, role: .search) {
+				self.searchView()
+			}
+		}
+	}
+
+	@ViewBuilder private func tabbedBody() -> some View {
+		if #available(iOS 26, *) {
+			self.modernTabbedBody()
+		}
+		else {
+			self.legacyTabbedBody()
+		}
+	}
+
+	@ViewBuilder private func splitBody() -> some View {
 		NavigationSplitView(
 			columnVisibility: $columnVisibility,
 			sidebar: {
@@ -134,6 +173,9 @@ private struct ContentView: View {
 					case .start:
 						StartOrSearchView(route: $route)
 
+					case .search:
+						self.searchView()
+
 					case .devices:
 						DevicesView()
 
@@ -170,28 +212,14 @@ private struct ContentView: View {
 	var body: some View {
 		Group {
 			if horizontalSizeClass == .compact {
-				self.tabbedBody
+				self.tabbedBody()
 			}
 			else {
-				self.splitBody
+				self.splitBody()
 			}
 		}
-		.sheet(
-			isPresented: $showOnboarding,
-			content: {
-				if #available(iOS 18, *) {
-					OnboardingView()
-						.interactiveDismissDisabled()
-						.presentationSizing(.form.fitted(horizontal: false, vertical: true))
-				}
-				else {
-					OnboardingView()
-						.interactiveDismissDisabled()
-				}
-			}
-		)
 		#if os(iOS)
-			.onChange(of: QuickActionService.shared.action) { _, newAction in
+			.onChange(of: QuickActionService.shared.action, initial: true) { _, newAction in
 				if case .search(for: let searchFor) = newAction {
 					self.route = .start
 					self.searchSheetSearchTerm = searchFor
@@ -210,58 +238,42 @@ private struct ContentView: View {
 					"You are using a custom configuration. This may be used for testing only, and at your own risk. Not all configuration options may be supported. To disable the custom configuration, remove the configuration files from the app's folder and restart the app. The makers of the app cannot be held liable for any data loss that may occur!"
 				),
 				dismissButton: .default(Text("I understand and agree")) {
-					self.showOnboardingIfNecessary()
+					// Further consent and warning stuff
+					AppState.requestNotificationPermissionIfNecessary()
 				})
 		}
 		.onAppear {
+			// Consent and warning stuff
 			if self.appState.client.isUsingCustomConfiguration {
 				self.showCustomConfigWarning = true
 			}
 			else {
-				self.showOnboardingIfNecessary()
-			}
-		}
-		.onChange(of: showOnboarding) { _, shown in
-			if !shown {
-				// End of onboarding, request notification authorization
 				AppState.requestNotificationPermissionIfNecessary()
 			}
 		}
 		#if os(iOS)
 			// Search sheet for quick action
 			.sheet(isPresented: $showSearchSheet) {
-				NavigationStack {
-					SearchView(
-						prefix: "",
-						initialSearchText: self.searchSheetSearchTerm
-					)
-					.navigationTitle("Search")
-					.navigationBarTitleDisplayMode(.inline)
-					.toolbar(content: {
-						ToolbarItem(
-							placement: .cancellationAction,
-							content: {
-								Button("Cancel") {
-									showSearchSheet = false
-								}
-							})
-					})
-				}
+				self.searchView()
 			}
 		#endif
 	}
 
-	private func showOnboardingIfNecessary() {
-		Log.info(
-			"Current onboarding version is \(Self.currentOnboardingVersion), user last saw \(self.onboardingVersionShown)"
-		)
-		if onboardingVersionShown < Self.currentOnboardingVersion {
-			self.showOnboarding = true
-			onboardingVersionShown = Self.currentOnboardingVersion
-		}
-		else {
-			// Go straight on to request notification permissions
-			AppState.requestNotificationPermissionIfNecessary()
+	@ViewBuilder private func searchView() -> some View {
+		NavigationStack {
+			SearchView(
+				prefix: "",
+				initialSearchText: self.searchSheetSearchTerm
+			)
+			.navigationTitle("Search")
+			#if os(iOS)
+				.navigationBarTitleDisplayMode(.inline)
+			#endif
+			.toolbar {
+				SheetButton(role: .done) {
+					showSearchSheet = false
+				}
+			}
 		}
 	}
 }
@@ -281,14 +293,14 @@ private struct LoadingMainView: View {
 				}
 
 				NavigationStack {
-					EmptyView()
+					LoadingView(appState: appState)
 				}
 				.tabItem {
 					Label("Folders", systemImage: "folder.fill")
 				}.disabled(true)
 
 				NavigationStack {
-					EmptyView()
+					LoadingView(appState: appState)
 				}
 				.tabItem {
 					Label("Devices", systemImage: "externaldrive.fill")
@@ -369,26 +381,31 @@ private struct StartOrSearchView: View {
 		}
 	}
 
-	private var view: some View {
-		ZStack {
+	@ViewBuilder private func view() -> some View {
+		if #available(iOS 26, *) {
 			InnerView(route: $route, searchText: $searchText)
 		}
-		.searchable(
-			text: $searchText, placement: SearchFieldPlacement.toolbar,
-			prompt: "Search all files and folders..."
-		)
-		#if os(iOS)
-			.textInputAutocapitalization(.never)
-		#endif
-		.autocorrectionDisabled()
+		else {
+			ZStack {
+				InnerView(route: $route, searchText: $searchText)
+			}
+			.searchable(
+				text: $searchText, placement: SearchFieldPlacement.toolbar,
+				prompt: "Search all files and folders..."
+			)
+			#if os(iOS)
+				.textInputAutocapitalization(.never)
+			#endif
+			.autocorrectionDisabled()
+		}
 	}
 
 	var body: some View {
 		if #available(iOS 18, *) {
-			self.view.searchFocused($isSearchFieldFocused)
+			self.view().searchFocused($isSearchFieldFocused)
 		}
 		else {
-			self.view
+			self.view()
 		}
 	}
 }

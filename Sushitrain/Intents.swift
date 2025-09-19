@@ -10,9 +10,13 @@ import UniformTypeIdentifiers
 private enum IntentHandlingError: LocalizedError {
 	case appStartupFailed(String)
 	case unsupported(String)
+	case onboardingRequired
 
 	var errorDescription: String? {
 		switch self {
+		case .onboardingRequired:
+			return String(localized: "Onboarding is required before performing intent tasks")
+
 		case .appStartupFailed(let msg):
 			return String(
 				localized: "Could not start the app: \(msg)"
@@ -28,7 +32,11 @@ extension AppState {
 		// Wait for app startup
 		do {
 			while self.startupState != .started {
-				if case .error(let msg) = self.startupState {
+				if case .onboarding = self.startupState {
+					Log.info("Onboarding required, cannot perform intent tasks now")
+					throw IntentHandlingError.onboardingRequired
+				}
+				else if case .error(let msg) = self.startupState {
 					Log.info("Error in app startup: \(msg); abort intent task")
 					throw IntentHandlingError.appStartupFailed(msg)
 				}
@@ -60,13 +68,92 @@ struct SynchronizePhotosIntent: AppIntent {
 	}
 }
 
+struct GenerateThumbnailsIntent: AppIntent {
+	static let title: LocalizedStringResource = "Generate thumbnails"
+
+	enum GenerateThumbnailsError: LocalizedError {
+		case notEnabled
+		case insufficientDiskSpace
+		case invalidTimeout
+
+		var errorDescription: String? {
+			switch self {
+			case .notEnabled: return String(localized: "thumbnail disk caching is not enabled")
+			case .insufficientDiskSpace: return String(localized: "there is insufficient disk space free to continue")
+			case .invalidTimeout: return String(localized: "the specified timeout is not valid")
+			}
+		}
+	}
+
+	@Dependency private var appState: AppState
+
+	@Parameter(title: "Folder", description: "Folder for which to generate thumbnails")
+	var folderEntity: FolderEntity
+
+	@Parameter(
+		title: "Subdirectory", description: "The subdirectory to generate thumbnails for (empty to rescan the whole folder)")
+	var subdirectory: String?
+
+	@Parameter(
+		title: "Time (seconds)", description: "How much time to allow for thumbnail generation.", default: 10,
+		controlStyle: .field, inclusiveRange: (0, 15))
+	var time: Int
+
+	@MainActor
+	func perform() async throws -> some IntentResult {
+		if time <= 0 {
+			throw GenerateThumbnailsError.invalidTimeout
+		}
+
+		try await appState.waitForAppStarted()
+		await appState.awake()
+
+		do {
+			// Check preconditions
+			let folder = self.folderEntity.folder
+			let ic = ImageCache.forFolder(folder)
+			if !ic.diskCacheEnabled {
+				throw GenerateThumbnailsError.notEnabled
+			}
+			if !ic.diskHasSpace {
+				throw GenerateThumbnailsError.insufficientDiskSpace
+			}
+
+			// Generate thumbnails
+			let tg = FolderSettingsManager.shared.settingsFor(folderID: folder.folderID).thumbnailGeneration
+
+			// Generate, wait for either the generation or the timeout to complete
+			try await withThrowingTaskGroup { group in
+				group.addTask {
+					try await generateThumbnailsFor(
+						folder: folder, prefix: self.subdirectory, userSettings: appState.userSettings, generation: tg)
+				}
+
+				group.addTask {
+					try await Task.sleep(for: .seconds(self.time))
+				}
+
+				defer { group.cancelAll() }
+				return try await group.next()
+			}
+		}
+		catch {
+			await appState.sleep()
+			throw error
+		}
+
+		return .result()
+	}
+}
+
 struct SynchronizeIntent: AppIntent {
 	static let title: LocalizedStringResource = "Synchronize for a while"
 
 	@Dependency private var appState: AppState
 
 	@Parameter(
-		title: "Time (seconds)", description: "How much time to allow for synchronization.", default: 10,
+		title: "Time (seconds)",
+		description: "How much time to allow for synchronization (must be between 1 and 15 seconds).", default: 10,
 		controlStyle: .field, inclusiveRange: (0, 15))
 	var time: Int
 
@@ -368,7 +455,7 @@ struct FolderEntity: AppEntity, Equatable {
 		return lhs.id == rhs.id
 	}
 
-	@Property(title: "Name")
+	@Property(title: "Display name")
 	var name: String
 
 	@Property(title: "URL")
@@ -408,6 +495,7 @@ struct FolderEntityQuery: EntityQuery, EntityStringQuery, EnumerableEntityQuery 
 
 struct DeviceEntityQuery: EntityQuery, EntityStringQuery, EnumerableEntityQuery {
 	func allEntities() async throws -> [DeviceEntity] {
+		try await appState.waitForAppStarted()
 		return await appState.peers().filter { !$0.isSelf() }.map {
 			DeviceEntity(peer: $0)
 		}

@@ -64,11 +64,6 @@ struct IdenticonView: View {
 
 				for row in 0..<cells {
 					for column in 0...middleColumn {
-						if row == cells - 1 && column == middleColumn {
-							// Bottom middle cell is apparently never filled
-							continue
-						}
-
 						if self.shouldFillRectAt(row: row, column: column) {
 							let square = CGRect(
 								x: xOffset + CGFloat(column) * rectWidth,
@@ -139,15 +134,11 @@ struct DeviceIDView: View {
 			content: {
 				NavigationStack {
 					QRView(text: self.device.deviceID())
-						.toolbar(content: {
-							ToolbarItem(
-								placement: .confirmationAction,
-								content: {
-									Button("Done") {
-										self.qrCodeShown = false
-									}
-								})
-						})
+						.toolbar {
+							SheetButton(role: .done) {
+								self.qrCodeShown = false
+							}
+						}
 				}
 			}
 		)
@@ -155,15 +146,11 @@ struct DeviceIDView: View {
 			NavigationStack {
 				ResolvedAddressesView()
 					.navigationTitle("Addresses")
-					.toolbar(content: {
-						ToolbarItem(
-							placement: .confirmationAction,
-							content: {
-								Button("Done") {
-									self.localAddressesShown = false
-								}
-							})
-					})
+					.toolbar {
+						SheetButton(role: .done) {
+							self.localAddressesShown = false
+						}
+					}
 			}
 		}
 	}
@@ -215,6 +202,12 @@ private struct QRView: View {
 	var body: some View {
 		ZStack {
 			VStack(alignment: .center, spacing: 10.0) {
+				Text(
+					"To connect another device running Synctrain or Syncthing to this device, scan the QR code or copy and paste the device ID below. Verify the device IDs of two connected devices match to ensure the connection is end-to-end encrypted."
+				)
+				.fixedSize(horizontal: false, vertical: true)
+				.multilineTextAlignment(.center)
+
 				if let image = image {
 					#if os(iOS)
 						Image(uiImage: image)
@@ -230,24 +223,32 @@ private struct QRView: View {
 					ProgressView()
 				}
 
-				Text(self.text).monospaced().contextMenu {
-					Button(action: {
-						#if os(iOS)
-							UIPasteboard.general.string = self.text
-						#endif
+				Text(self.text)
+					.monospaced()
+					.bold()
+					.textSelection(.enabled)
+					.fixedSize(horizontal: false, vertical: true)
+					.multilineTextAlignment(.center)
+					.padding(10.0)
+					.contextMenu {
+						Button(action: {
+							#if os(iOS)
+								UIPasteboard.general.string = self.text
+							#endif
 
-						#if os(macOS)
-							let pasteboard = NSPasteboard.general
-							pasteboard.clearContents()
-							pasteboard.prepareForNewContents()
-							pasteboard.setString(self.text, forType: .string)
-						#endif
-					}) {
-						Text("Copy to clipboard")
-						Image(systemName: "doc.on.doc")
+							#if os(macOS)
+								let pasteboard = NSPasteboard.general
+								pasteboard.clearContents()
+								pasteboard.prepareForNewContents()
+								pasteboard.setString(self.text, forType: .string)
+							#endif
+						}) {
+							Text("Copy to clipboard")
+							Image(systemName: "doc.on.doc")
+						}
 					}
-				}
 			}
+			.padding(10.0)
 		}
 		.navigationTitle("Device ID")
 		#if os(iOS)

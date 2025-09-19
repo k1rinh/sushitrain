@@ -16,11 +16,25 @@ struct BrowserListView: View {
 	let subdirectories: [SushitrainEntry]
 	let viewStyle: BrowserViewStyle
 
+	@State private var showStatistics = false
+
 	var body: some View {
 		List {
 			Section {
-				FolderStatusView(folder: folder)
-					.id(appState.eventCounter)  // Update for each event
+				Button(action: {
+					showStatistics = true
+				}) {
+					FolderStatusView(folder: folder)
+				}.sheet(isPresented: $showStatistics) {
+					NavigationStack {
+						FolderStatisticsView(folder: folder)
+							.toolbar {
+								SheetButton(role: .done) {
+									showStatistics = false
+								}
+							}
+					}
+				}
 
 				if hasExtraneousFiles {
 					NavigationLink(destination: { ExtraFilesView(folder: self.folder) }) {
@@ -75,17 +89,7 @@ struct BrowserListView: View {
 			}
 
 			// Show number of items
-			Group {
-				if !self.subdirectories.isEmpty && self.files.isEmpty {
-					Text("\(self.subdirectories.count) subdirectories")
-				}
-				else if !self.files.isEmpty && self.subdirectories.isEmpty {
-					Text("\(self.files.count) files")
-				}
-				else if !self.files.isEmpty && !self.subdirectories.isEmpty {
-					Text("\(self.files.count) files and \(self.subdirectories.count) subdirectories")
-				}
-			}.font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity)
+			FilesFooterView(subdirectories: self.subdirectories.count, files: self.files.count)
 				#if os(iOS)
 					.listRowBackground(Color(.systemGroupedBackground))
 				#endif
@@ -279,17 +283,15 @@ struct FileEntryLink<Content: View>: View {
 
 			// Show file in Finder
 			if entry.canShowInFinder {
-				Button(
-					openInFilesAppLabel,
-					systemImage: "arrow.up.forward.app",
-					action: {
-						try? entry.showInFinder()
-					}
-				)
+				Button(openInFilesAppLabel, systemImage: "arrow.up.forward.app") {
+					try? entry.showInFinder()
+				}
 			}
 
 			#if os(macOS)
-				Button("Copy", systemImage: "document.on.document") { self.copy() }.disabled(!entry.isLocallyPresent())
+				Button("Copy", systemImage: "document.on.document") {
+					self.copy()
+				}.disabled(!entry.isLocallyPresent())
 			#endif
 
 			// Show 'go to location' in list if we are not in the file's folder already
@@ -347,30 +349,30 @@ private struct ItemSelectSwipeView<Content: View>: View {
 
 	var body: some View {
 		if self.file.isSelectionToggleAvailable {
-			self.content.alert(
-				isPresented: Binding(get: { errorMessage != nil }, set: { s in errorMessage = s ? errorMessage : nil })
-			) {
-				Alert(
-					title: Text("Could not change synchronization setting"), message: Text(errorMessage ?? ""),
-					dismissButton: .default(Text("OK")))
-			}.swipeActions(allowsFullSwipe: false) {
-				if file.isExplicitlySelected() || file.isSelected() {
-					// Unselect button
-					Button {
-						Task { self.errorMessage = await self.file.setSelectedFromToggle(s: false) }
-					} label: {
-						Label("Do not synchronize with this device", systemImage: "pin.slash")
-					}.tint(.red)
+			self.content
+				.alert(isPresented: Binding.isNotNil($errorMessage)) {
+					Alert(
+						title: Text("Could not change synchronization setting"), message: Text(errorMessage ?? ""),
+						dismissButton: .default(Text("OK")))
 				}
-				else {
-					// Select button
-					Button {
-						Task { self.errorMessage = await self.file.setSelectedFromToggle(s: true) }
-					} label: {
-						Label("Synchronize with this device", systemImage: "pin")
+				.swipeActions(allowsFullSwipe: false) {
+					if file.isExplicitlySelected() || file.isSelected() {
+						// Unselect button
+						Button {
+							Task { self.errorMessage = await self.file.setSelectedFromToggle(s: false) }
+						} label: {
+							Label("Do not synchronize with this device", systemImage: "pin.slash")
+						}.tint(.red)
+					}
+					else {
+						// Select button
+						Button {
+							Task { self.errorMessage = await self.file.setSelectedFromToggle(s: true) }
+						} label: {
+							Label("Synchronize with this device", systemImage: "pin")
+						}
 					}
 				}
-			}
 		}
 		else {
 			self.content

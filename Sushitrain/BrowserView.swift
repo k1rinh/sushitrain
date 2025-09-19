@@ -14,14 +14,24 @@ enum BrowserViewStyle: String {
 	case web = "web"
 }
 
+private struct FolderPopoverView: View {
+	let folder: SushitrainFolder
+
+	var body: some View {
+		NavigationStack {
+			FolderStatisticsView(folder: folder).frame(minWidth: 320, minHeight: 420, maxHeight: 400)
+		}
+	}
+}
+
 struct BrowserView: View {
 	@Environment(AppState.self) private var appState
 	var folder: SushitrainFolder
 	var prefix: String
 
 	@State private var showSettings = false
-	@State private var showFolderStatistics = false
 	@State private var searchText = ""
+	@State private var canShowInFinder = false
 	@State private var localNativeURL: URL? = nil
 	@State private var folderExists = false
 	@State private var folderIsSelective = false
@@ -33,6 +43,10 @@ struct BrowserView: View {
 	#if os(macOS)
 		@State private var showIgnores = false
 		@State private var showStatusPopover = false
+	#endif
+
+	#if os(iOS)
+		@State private var showFolderStatistics = false
 	#endif
 
 	private func currentViewStyle() -> Binding<BrowserViewStyle> {
@@ -84,15 +98,11 @@ struct BrowserView: View {
 					SearchView(prefix: self.prefix, folder: self.folder)
 					.navigationTitle("Search in this folder")
 					.navigationBarTitleDisplayMode(.inline)
-					.toolbar(content: {
-						ToolbarItem(
-							placement: .cancellationAction,
-							content: {
-								Button("Cancel") {
-									showSearch = false
-								}
-							})
-					})
+					.toolbar {
+						SheetButton(role: .cancel) {
+							showSearch = false
+						}
+					}
 				}
 			}
 		#endif
@@ -102,101 +112,27 @@ struct BrowserView: View {
 		#endif
 
 		.toolbar {
-			#if os(macOS)
-				// On iOS, this is done with .navigationTitle() and the sync status is shown in the view
-				ToolbarItem(placement: .navigation) {
-					let fsd = FolderStatusDescription(folder)
-					HStack(alignment: .center) {
-						Button(fsd.text, systemImage: fsd.systemImage) {
-							showStatusPopover = true
-						}
-						.animation(.spring(), value: fsd.systemImage)
-						.labelStyle(.iconOnly)
-						.foregroundStyle(fsd.color)
-						.accessibilityLabel(fsd.text)
-						.popover(isPresented: $showStatusPopover, arrowEdge: .bottom) {
-							FolderStatusView(folder: folder)
-								.id(appState.eventCounter)  // Update for each event
-								.padding()
-								.frame(minWidth: 120)
-						}
-						Text(folderName).font(.headline)
-					}
-				}
-
-				ToolbarItemGroup(placement: .status) {
-					Picker("View as", selection: self.currentViewStyle()) {
-						Image(systemName: "list.bullet").tag(BrowserViewStyle.list)
-							.accessibilityLabel(Text("List"))
-						Image(systemName: "checklist.unchecked").tag(BrowserViewStyle.thumbnailList)
-							.accessibilityLabel(Text("List with previews"))
-						Image(systemName: "square.grid.2x2").tag(BrowserViewStyle.grid)
-							.accessibilityLabel(Text("Grid"))
-
-						if webViewAvailable {
-							Image(systemName: "doc.text.image")
-								.tag(BrowserViewStyle.web)
-								.accessibilityLabel(Text("Web page"))
-						}
-					}
-					.pickerStyle(.segmented)
-				}
-			#endif
-
-			#if os(macOS)
-				ToolbarItem {
-					// Open in Finder/Files (and possibly materialize empty folder)
-					if let localNativeURL = self.localNativeURL {
-						Button(
-							openInFilesAppLabel, systemImage: "arrow.up.forward.app",
-							action: {
-								openURLInSystemFilesApp(url: localNativeURL)
-							}
-						).disabled(!folderExists)
-					}
-					else if folderExists {
-						if let entry = try? self.folder.getFileInformation(self.prefix.withoutEndingSlash) {
-							if entry.isDirectory() && !entry.isLocallyPresent() && entry.canShowInFinder {
-								Button(
-									openInFilesAppLabel, systemImage: "arrow.up.forward.app",
-									action: {
-										try? entry.showInFinder()
-									})
-							}
-						}
-					}
-				}
-			#endif
-
-			ToolbarItem {
-				self.folderMenu()
-			}
+			self.toolbarContent()
 		}
-		.sheet(isPresented: $showFolderStatistics) {
-			NavigationStack {
-				FolderStatisticsView(folder: folder)
-					.toolbar(content: {
-						ToolbarItem(
-							placement: .confirmationAction,
-							content: {
-								Button("Done") {
-									showFolderStatistics = false
-								}
-							})
-					})
+		#if os(iOS)
+			.sheet(isPresented: $showFolderStatistics) {
+				NavigationStack {
+					FolderStatisticsView(folder: folder)
+					.toolbar {
+						SheetButton(role: .done) {
+							showFolderStatistics = false
+						}
+					}
+				}
 			}
-		}
+		#endif
 		.sheet(isPresented: $showSettings) {
 			NavigationStack {
 				FolderView(folder: self.folder)
 					.toolbar {
-						ToolbarItem(
-							placement: .confirmationAction,
-							content: {
-								Button("Done") {
-									showSettings = false
-								}
-							})
+						SheetButton(role: .save) {
+							showSettings = false
+						}
 					}
 			}
 		}
@@ -208,13 +144,9 @@ struct BrowserView: View {
 					.presentationSizing(.fitted)
 					.frame(minWidth: 640, minHeight: 480)
 					.toolbar {
-						ToolbarItem(
-							placement: .confirmationAction,
-							content: {
-								Button("Done") {
-									showIgnores = false
-								}
-							})
+						SheetButton(role: .done) {
+							showIgnores = false
+						}
 					}
 				}
 			}
@@ -252,19 +184,75 @@ struct BrowserView: View {
 					return true
 				})
 		#endif
-		.alert(
-			isPresented: Binding(
-				get: { return self.error != nil },
-				set: { nv in
-					if !nv {
-						self.error = nil
-					}
-				})
-		) {
+		.alert(isPresented: Binding.isNotNil($error)) {
 			Alert(
 				title: Text("An error occurred"),
 				message: self.error == nil ? nil : Text(self.error!.localizedDescription),
 				dismissButton: .default(Text("OK")))
+		}
+	}
+
+	@ToolbarContentBuilder private func toolbarContent() -> some ToolbarContent {
+		#if os(macOS)
+			// On iOS, this is done with .navigationTitle() and the sync status is shown in the view
+			ToolbarItem(placement: .navigation) {
+				let fsd = FolderStatusDescription(folder)
+				HStack(alignment: .center) {
+					Button(fsd.text, systemImage: fsd.systemImage) {
+						showStatusPopover = true
+					}
+					.animation(.spring(), value: fsd.systemImage)
+					.labelStyle(.iconOnly)
+					.foregroundStyle(fsd.color)
+					.accessibilityLabel(fsd.text)
+					.popover(isPresented: $showStatusPopover, arrowEdge: .bottom) {
+						FolderPopoverView(folder: folder)
+					}
+					Text(folderName).font(.headline).padding(.trailing, 20)
+				}
+			}
+
+			ToolbarItemGroup(placement: .status) {
+				Picker("View as", selection: self.currentViewStyle()) {
+					Image(systemName: "list.bullet").tag(BrowserViewStyle.list)
+						.accessibilityLabel(Text("List"))
+					Image(systemName: "checklist.unchecked").tag(BrowserViewStyle.thumbnailList)
+						.accessibilityLabel(Text("List with previews"))
+					Image(systemName: "square.grid.2x2").tag(BrowserViewStyle.grid)
+						.accessibilityLabel(Text("Grid"))
+
+					if webViewAvailable {
+						Image(systemName: "doc.text.image")
+							.tag(BrowserViewStyle.web)
+							.accessibilityLabel(Text("Web page"))
+					}
+				}
+				.pickerStyle(.segmented)
+			}
+		#endif
+
+		ToolbarItemGroup(placement: .primaryAction) {
+			#if os(macOS)
+				Button(openInFilesAppLabel, systemImage: "arrow.up.forward.app") {
+					self.showInFinder()
+				}.disabled(!canShowInFinder)
+			#endif
+			self.folderMenu()
+		}
+	}
+
+	private func showInFinder() {
+		if !canShowInFinder {
+			return
+		}
+		// Open in Finder/Files (and possibly materialize empty folder)
+		if let localNativeURL = self.localNativeURL {
+			openURLInSystemFilesApp(url: localNativeURL)
+		}
+		else {
+			if let entry = try? self.folder.getFileInformation(self.prefix.withoutEndingSlash) {
+				try? entry.showInFinder()
+			}
 		}
 	}
 
@@ -308,31 +296,16 @@ struct BrowserView: View {
 
 			if folderExists {
 				#if os(iOS)
-					// Open in Finder/Files (and possibly materialize empty folder)
-					// On macOS this has its own toolbar button
-					if let localNativeURL = self.localNativeURL {
-						Button(
-							openInFilesAppLabel, systemImage: "arrow.up.forward.app",
-							action: {
-								openURLInSystemFilesApp(url: localNativeURL)
-							})
-					}
-					else {
-						if let entry = try? self.folder.getFileInformation(self.prefix.withoutEndingSlash),
-							entry.isDirectory() && !entry.isLocallyPresent()
-						{
-							Button(
-								openInFilesAppLabel, systemImage: "arrow.up.forward.app",
-								action: {
-									try? entry.showInFinder()
-								})
-						}
-					}
+					Button(openInFilesAppLabel, systemImage: "arrow.up.forward.app") {
+						self.showInFinder()
+					}.disabled(!canShowInFinder)
 				#endif
 
-				Button("Folder statistics...", systemImage: "scalemass") {
-					showFolderStatistics = true
-				}
+				#if os(iOS)
+					Button("Folder statistics...", systemImage: "chart.pie") {
+						showFolderStatistics = true
+					}
+				#endif
 
 				if folderIsSelective && folder.isRegularFolder {
 					NavigationLink(destination: SelectiveFolderView(folder: folder, prefix: "")) {
@@ -442,8 +415,13 @@ struct BrowserView: View {
 	#endif
 
 	private func updateLocalURL() {
-		// Get local native URL
-		self.localNativeURL = nil
+		if !self.folder.exists() {
+			self.localNativeURL = nil
+			self.canShowInFinder = false
+			return
+		}
+
+		// Check if we can get a local native URL
 		var error: NSError? = nil
 		let localNativePath = self.folder.localNativePath(&error)
 
@@ -453,6 +431,15 @@ struct BrowserView: View {
 
 			if FileManager.default.fileExists(atPath: localNativeURL.path) {
 				self.localNativeURL = localNativeURL
+				self.canShowInFinder = true
+				return
+			}
+		}
+
+		// Check if this entry supports lazy creation
+		if let entry = try? self.folder.getFileInformation(self.prefix.withoutEndingSlash) {
+			if entry.isDirectory() && !entry.isLocallyPresent() && entry.canShowInFinder {
+				self.canShowInFinder = true
 			}
 		}
 	}
@@ -474,6 +461,7 @@ private struct BrowserItemsView: View {
 	@State private var showSpinner = false
 	@State private var folderExists = false
 	@State private var folderIsPaused = false
+	@State private var showStatistics = false
 
 	@Environment(\.isSearching) private var isSearching
 
@@ -527,6 +515,11 @@ private struct BrowserItemsView: View {
 		.task(id: self.folder.folderStateForUpdating) {
 			await self.reload()
 		}
+		.onChange(of: appState.userSettings.dotFilesHidden) {
+			Task {
+				await self.reload()
+			}
+		}
 		.onChange(of: self.folder.folderStateForUpdating) {
 			Task {
 				await self.reload()
@@ -550,9 +543,20 @@ private struct BrowserItemsView: View {
 				VStack {
 					HStack {
 						#if os(iOS)
-							FolderStatusView(folder: folder)
-								.id(appState.eventCounter)  // Update for each event
-								.padding(.all, 10)
+							Button(action: {
+								showStatistics = true
+							}) {
+								FolderStatusView(folder: folder).padding(.horizontal, 10).padding(.vertical, 15)
+							}.sheet(isPresented: $showStatistics) {
+								NavigationStack {
+									FolderStatisticsView(folder: folder)
+										.toolbar {
+											SheetButton(role: .done) {
+												showStatistics = false
+											}
+										}
+								}
+							}
 						#endif
 
 						Spacer()
@@ -601,6 +605,9 @@ private struct BrowserItemsView: View {
 					folder: folder,
 					columns: columns
 				)
+				#if os(macOS)
+					.padding(.leading, 5.0)
+				#endif
 			})
 	}
 
@@ -901,5 +908,28 @@ private struct BrowserViewStylePickerView: View {
 			}
 		}
 		.pickerStyle(.inline)
+	}
+}
+
+struct FilesFooterView: View {
+	let subdirectories: Int
+	let files: Int
+
+	var body: some View {
+		// Show number of items
+		Group {
+			if self.subdirectories > 0 && self.files == 0 {
+				Text("\(self.subdirectories) subdirectories")
+			}
+			else if self.files > 0 && self.subdirectories == 0 {
+				Text("\(self.files) files")
+			}
+			else if self.files > 0 && self.subdirectories > 0 {
+				Text("\(self.files) files and \(self.subdirectories) subdirectories")
+			}
+		}
+		.font(.footnote)
+		.foregroundColor(.secondary)
+		.frame(maxWidth: .infinity)
 	}
 }

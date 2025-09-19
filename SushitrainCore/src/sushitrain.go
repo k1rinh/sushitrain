@@ -6,7 +6,9 @@
 package sushitrain
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -14,15 +16,17 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"log"
 	"log/slog"
 	"math"
 	"net/url"
 	"os"
 	"path"
+	"runtime"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/build"
@@ -58,6 +62,7 @@ type Client struct {
 	mutex                    sync.Mutex
 	extraneousIgnored        []string
 	Measurements             *Measurements
+	logHandler               *logHandler
 }
 
 type Change struct {
@@ -103,7 +108,7 @@ const (
 
 func NewClient(configPath string, filesPath string, saveLog bool) *Client {
 	// Set version info
-	build.Version = "v2.0.2"
+	build.Version = "v2.0.9"
 	build.Host = "t-shaped.nl"
 	build.User = "sushitrain"
 
@@ -136,7 +141,8 @@ func NewClient(configPath string, filesPath string, saveLog bool) *Client {
 	} else if saveLog {
 		minLevel = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(newLogHandler(logOutWriter, minLevel)))
+	logHandler := newLogHandler(logOutWriter, minLevel)
+	slog.SetDefault(slog.New(logHandler))
 
 	// Set up default locations
 	locations.SetBaseDir(locations.DataBaseDir, configPath)
@@ -194,6 +200,7 @@ func NewClient(configPath string, filesPath string, saveLog bool) *Client {
 		ResolvedListenAddresses:    make(map[string][]string),
 		extraneousIgnored:          make([]string, 0),
 		Measurements:               nil,
+		logHandler:                 logHandler,
 	}
 }
 
@@ -593,7 +600,8 @@ func (clt *Client) Load(resetDeltaIdxs bool) error {
 
 	// Default retention interval taken from Syncthing's CLI default
 	dbDeleteRetentionInterval := time.Duration(4320) * time.Hour
-	if err := syncthing.TryMigrateDatabase(dbDeleteRetentionInterval); err != nil {
+	// It really wants to set up a temporary API while migrating...
+	if err := syncthing.TryMigrateDatabase(clt.ctx, dbDeleteRetentionInterval); err != nil {
 		slog.Warn("failed to migrate legacy database", "cause", err)
 		return err
 	}
@@ -686,19 +694,21 @@ func loadOrDefaultConfig(devID protocol.DeviceID, ctx context.Context, logger ev
 		// run. Therefore we re-set the absolute folder path here to [app documents directory]/[folder ID] if we don't have
 		// a folder marker in the old location but do have one in the new.
 		for _, folderConfig := range conf.Folders {
-			standardPath := path.Join(filesPath, folderConfig.ID)
-			if folderConfig.Path != standardPath {
-				slog.Warn("configured folder path differs from expected path", "configured", folderConfig.Path, "expected", standardPath)
+			if folderConfig.FilesystemType == config.FilesystemTypeBasic {
+				standardPath := path.Join(filesPath, folderConfig.ID)
+				if folderConfig.Path != standardPath {
+					slog.Warn("configured folder path differs from expected path", "configured", folderConfig.Path, "expected", standardPath)
 
-				oldMarkerPath := path.Join(folderConfig.Path, folderConfig.MarkerName)
-				if _, err := os.Stat(oldMarkerPath); errors.Is(err, os.ErrNotExist) {
-					newMarkerPath := path.Join(standardPath, folderConfig.MarkerName)
-					if _, err := os.Stat(newMarkerPath); errors.Is(err, os.ErrNotExist) {
-						slog.Warn("marker does not exist at either old or new location, not changing anything", "oldMarkerPath", oldMarkerPath, "newMarkerPath", newMarkerPath)
-					} else {
-						slog.Warn("marker does not exist at old location and exists at new location, resetting standard path", "oldMarkerPath", oldMarkerPath, "newMarkerPath", newMarkerPath, "standardPath", standardPath)
-						folderConfig.Path = standardPath
-						conf.SetFolder(folderConfig)
+					oldMarkerPath := path.Join(folderConfig.Path, folderConfig.MarkerName)
+					if _, err := os.Stat(oldMarkerPath); errors.Is(err, os.ErrNotExist) {
+						newMarkerPath := path.Join(standardPath, folderConfig.MarkerName)
+						if _, err := os.Stat(newMarkerPath); errors.Is(err, os.ErrNotExist) {
+							slog.Warn("marker does not exist at either old or new location, not changing anything", "oldMarkerPath", oldMarkerPath, "newMarkerPath", newMarkerPath)
+						} else {
+							slog.Warn("marker does not exist at old location and exists at new location, resetting standard path", "oldMarkerPath", oldMarkerPath, "newMarkerPath", newMarkerPath, "standardPath", standardPath)
+							folderConfig.Path = standardPath
+							conf.SetFolder(folderConfig)
+						}
 					}
 				}
 			}
@@ -1481,6 +1491,148 @@ func (c *Client) ClearDatabase() error {
 	return os.RemoveAll(dbPath)
 }
 
+func (c *Client) GetLastLogLines() (string, error) {
+	var buf bytes.Buffer
+	err := c.logHandler.tail.write(&buf, true)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func (c *Client) WriteSupportBundle(path string, appInfo []byte) error {
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	err = c.generateSupportBundle(out, appInfo)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) generateSupportBundle(writer io.Writer, appInfo []byte) error {
+	zipWriter := zip.NewWriter(writer)
+	defer zipWriter.Close() // We might close twice but that's alright
+
+	// Write app support info
+	if len(appInfo) > 0 {
+		appInfo = []byte(redactLog(string(appInfo)))
+		appInfoWriter, err := zipWriter.CreateHeader(&zip.FileHeader{
+			Name:     "info-app.json",
+			Modified: time.Now(),
+			Method:   zip.Deflate,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = appInfoWriter.Write(appInfo)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Write log tail
+	logTailFileWriter, err := zipWriter.CreateHeader(&zip.FileHeader{
+		Name:     "log-tail.txt",
+		Modified: time.Now(),
+		Method:   zip.Deflate,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := c.logHandler.tail.write(logTailFileWriter, true); err != nil {
+		return err
+	}
+
+	// Write a general info JSON
+	infoJson := make(map[string]any)
+	infoJson["version"] = build.Version
+	infoJson["shortDeviceID"] = c.ShortDeviceID()
+	infoJson["isUsingCustomConfiguration"] = c.IsUsingCustomConfiguration
+	infoJson["isIgnoringEvents"] = c.IgnoreEvents
+	infoJson["extraneousIgnored"] = c.extraneousIgnored
+	infoJson["hasLegacyDatabase"] = c.HasLegacyDatabase()
+	infoJson["hasMigratedLegacyDatabase"] = c.HasMigratedLegacyDatabase()
+	infoJson["connectedPeerCount"] = c.ConnectedPeerCount()
+	infoJson["bundleGeneratedAt"] = time.Now().Format(time.RFC3339)
+	infoJson["redactedConfig"] = c.getRedactedConfigFile()
+	infoJson["numGoroutines"] = runtime.NumGoroutine()
+	infoJson["numCPUs"] = runtime.NumCPU()
+
+	var rlimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err == nil {
+		infoJson["currentFileDescriptorLimit"] = rlimit.Cur
+		infoJson["maxFileDescriptorLimit"] = rlimit.Max
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	infoJson["allocatedHeapBytes"] = m.Alloc
+	infoJson["sysMemoryBytes"] = m.Sys - m.HeapReleased
+
+	jsonData, err := json.MarshalIndent(infoJson, "", "\t")
+	if err != nil {
+		return err
+	}
+	jsonData = []byte(redactLog(string(jsonData)))
+	jsonWriter, err := zipWriter.CreateHeader(&zip.FileHeader{
+		Name:     "info.json",
+		Modified: time.Now(),
+		Method:   zip.Deflate,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = jsonWriter.Write(jsonData)
+	if err != nil {
+		return err
+	}
+
+	// Goroutine profile
+	if p := pprof.Lookup("goroutine"); p != nil {
+		goroutineWriter, err := zipWriter.CreateHeader(&zip.FileHeader{
+			Name:     "goroutines.pprof",
+			Modified: time.Now(),
+			Method:   zip.Deflate,
+		})
+		if err != nil {
+			return err
+		}
+		_ = p.WriteTo(goroutineWriter, 0)
+	}
+
+	if err = zipWriter.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) getRedactedConfigFile() config.Configuration {
+	rawConf := c.config.RawCopy()
+	rawConf.GUI.APIKey = "•••"
+	if rawConf.GUI.Password != "" {
+		rawConf.GUI.Password = "•••"
+	}
+	if rawConf.GUI.User != "" {
+		rawConf.GUI.User = "•••"
+	}
+
+	for fi, f := range rawConf.Folders {
+		for di, d := range f.Devices {
+			if len(d.EncryptionPassword) > 0 {
+				d.EncryptionPassword = "•••"
+				rawConf.Folders[fi].Devices[di] = d
+			}
+		}
+	}
+
+	return rawConf
+}
+
 /** Returns the free disk space on the volume where the database is stored */
 func GetFreeDiskSpaceMegaBytes() int {
 	dbPath := locations.Get(locations.Database)
@@ -1560,84 +1712,4 @@ func (m *Measurements) Measure() {
 	m.mutex.Lock()
 	m.isMeasuring = false
 	m.mutex.Unlock()
-}
-
-type stackedHandler struct {
-	handler slog.Handler
-	attrs   []slog.Attr
-}
-
-func (s *stackedHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return s.handler.Enabled(ctx, level)
-}
-
-func (s *stackedHandler) Handle(ctx context.Context, r slog.Record) error {
-	rec := r.Clone()
-	rec.AddAttrs(s.attrs...)
-	return s.handler.Handle(ctx, rec)
-}
-
-func (s *stackedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &stackedHandler{
-		handler: s.handler,
-		attrs:   append(s.attrs, attrs...),
-	}
-}
-
-func (s *stackedHandler) WithGroup(name string) slog.Handler {
-	return &stackedHandler{
-		handler: s.handler,
-		attrs:   append(s.attrs, slog.String("group", name)),
-	}
-}
-
-var _ slog.Handler = (*stackedHandler)(nil)
-
-type logHandler struct {
-	l        *log.Logger
-	minLevel slog.Level
-}
-
-var _ slog.Handler = (*logHandler)(nil)
-
-func (h *logHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return level >= h.minLevel
-}
-
-func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &stackedHandler{
-		handler: h,
-		attrs:   attrs,
-	}
-}
-
-func (h *logHandler) WithGroup(name string) slog.Handler {
-	return &stackedHandler{
-		handler: h,
-		attrs:   []slog.Attr{slog.String("group", name)},
-	}
-}
-
-func (h *logHandler) Handle(ctx context.Context, r slog.Record) error {
-	var sb strings.Builder
-	r.Attrs(func(a slog.Attr) bool {
-		sb.WriteString(a.Key)
-		sb.WriteRune('=')
-		sb.WriteString(a.Value.String())
-		sb.WriteRune(' ')
-		return true
-	})
-
-	timeStr := r.Time.Format("[15:05:05.000]")
-	h.l.Println(timeStr, r.Level.String(), r.Message, sb.String())
-	return nil
-}
-
-func newLogHandler(out io.Writer, minLevel slog.Level) *logHandler {
-	h := &logHandler{
-		l:        log.New(out, "", 0),
-		minLevel: minLevel,
-	}
-
-	return h
 }

@@ -25,6 +25,17 @@ enum FolderMetric: String {
 	case localPercentage = "localPercentage"
 }
 
+enum DeviceMetric: String {
+	case none = ""
+	case latency = "latency"
+	case needBytes = "needBytes"
+	case needItems = "needItems"
+	case completionPercentage = "completionPercentage"
+	case shortID = "shortID"
+	case lastSeenAgo = "lastSeenAgo"
+	case lastAddress = "lastAddress"
+}
+
 #if os(macOS)
 	enum MenuFolderAction: String, Hashable, Equatable {
 		// Do not show folder shortcuts in menu
@@ -43,6 +54,7 @@ enum FolderMetric: String {
 
 enum AppStartupState: Equatable {
 	case notStarted
+	case onboarding
 	case error(String)
 	case started
 }
@@ -70,6 +82,7 @@ class SushitrainDelegate: NSObject {
 	@AppStorage("hideHiddenFolders") var hideHiddenFolders: Bool = false
 	@AppStorage("lingeringEnabled") var lingeringEnabled: Bool = true
 	@AppStorage("foldersViewMetric") var viewMetric: FolderMetric = .none
+	@AppStorage("devicesViewMetric") var devicesViewMetric: DeviceMetric = .none
 	@AppStorage("previewVideos") var previewVideos: Bool = false
 	@AppStorage("tapFileToPreview") var tapFileToPreview: Bool = false
 	@AppStorage("cacheThumbnailsToDisk") var cacheThumbnailsToDisk: Bool = true
@@ -80,9 +93,20 @@ class SushitrainDelegate: NSObject {
 	@AppStorage("automaticallyShowWebpages") var automaticallyShowWebpages: Bool = true
 	@AppStorage("migratedToV2At") var migratedToV2At: Double = 0.0
 	@AppStorage("userPausedDevices") var userPausedDevices = Set<String>()
+	@AppStorage("ignoreLongTimeNoSeeDevices") var ignoreLongTimeNoSeeDevices = Set<String>()
+
+	@AppStorage("onboardingVersionShown") var onboardingVersionShown = 0
+
+	// Number of seconds after which we remind the user that a device hasn't connected in a while
+	@AppStorage("longTimeNoSeeInterval") var longTimeNoSeeInterval = 86400.0 * 2.0  // two days
 
 	// Whether to ignore certain files by default when scanning for extraneous files (i.e. .DS_Store)
 	@AppStorage("ignoreExtraneousDefaultFiles") var ignoreExtraneousDefaultFiles: Bool = true
+
+	// When did we apply privacy choices from the onboarding?
+	@AppStorage("appliedOnboardingPrivacyChoicesAt") var appliedOnboardingPrivacyChoicesAt: Double = 0.0
+
+	@AppStorage("forceOnboardingOnNextStartup") var forceOnboardingOnNextStartup = false
 
 	#if os(macOS)
 		@AppStorage("menuFolderAction") var menuFolderAction: MenuFolderAction = .finderExceptSelective
@@ -112,6 +136,8 @@ struct SyncState {
 }
 
 @Observable @MainActor class AppState {
+	private static let currentOnboardingVersion = 1
+
 	@ObservationIgnored nonisolated let client: SushitrainClient
 	@ObservationIgnored var photoBackup = PhotoBackup()
 	@ObservationIgnored var changePublisher = PassthroughSubject<Void, Never>()
@@ -173,81 +199,118 @@ struct SyncState {
 	}
 
 	@MainActor func start() async {
-		if self.startupState != .notStarted {
+		if self.startupState != .notStarted || self.startupState != .onboarding {
 			assertionFailure("cannot start again")
 		}
 
-		self.isMigratedToNewDatabase = !client.hasLegacyDatabase()
+		let client = self.client
 
-		#if os(iOS)
-			// If we are not migrated and we are in the background, bail out. We want to migrate in the foreground only
-			if !self.isMigratedToNewDatabase && UIApplication.shared.applicationState == .background {
-				Log.warn(
-					"The app is started in the background but it still has a legacy database. Please open it in the foreground to upgrade the database."
-				)
-				self.startupState = .error(
-					String(localized: "The app needs to be opened in the foreground at least once to upgrade the database."))
+		// If we are called again from onboarding, skip the stuff we already did
+		if self.startupState == .notStarted {
+			self.isMigratedToNewDatabase = !client.hasLegacyDatabase()
+
+			#if os(iOS)
+				// If we are not migrated and we are in the background, bail out. We want to migrate in the foreground only
+				if !self.isMigratedToNewDatabase && UIApplication.shared.applicationState == .background {
+					Log.warn(
+						"The app is started in the background but it still has a legacy database. Please open it in the foreground to upgrade the database."
+					)
+					self.startupState = .error(
+						String(localized: "The app needs to be opened in the foreground at least once to upgrade the database."))
+					return
+				}
+			#endif
+
+			let resetDeltas = UserDefaults.standard.bool(forKey: "resetDeltas")
+			if resetDeltas {
+				Log.info("Reset deltas requested from settings")
+			}
+
+			do {
+				// Load the client
+				try await Task.detached(priority: .userInitiated) {
+					// This one opens the database, migrates stuff, etc. and may take a while
+					Log.info("Loading the client...")
+					try client.load(resetDeltas)
+					if resetDeltas {
+						UserDefaults.standard.setValue(false, forKey: "resetDeltas")
+					}
+					Log.info("Client loaded")
+				}.value
+
+				// Resolve bookmarks
+				let folderIDs = client.folders()?.asArray() ?? []
+				for folderID in folderIDs {
+					do {
+						if let bm = try BookmarkManager.shared.resolveBookmark(folderID: folderID) {
+							Log.info("We have a bookmark for folder \(folderID): \(bm)")
+							if let folder = client.folder(withID: folderID) {
+								try folder.setPath(bm.path(percentEncoded: false))
+							}
+							else {
+								Log.warn(
+									"Cannot obtain folder configuration for \(folderID) for setting bookmark; skipping"
+								)
+							}
+						}
+					}
+					catch {
+						Log.warn("Error restoring bookmark for \(folderID): \(error.localizedDescription)")
+					}
+				}
+
+				await self.updateDeviceSuspension()
+
+				// Do we need to pause all folders?
+				let pauseAllFolders = UserDefaults.standard.bool(forKey: "pauseAllFolders")
+				if pauseAllFolders {
+					Log.info("Pausing all folders at the user's request...")
+					UserDefaults.standard.setValue(false, forKey: "pauseAllFolders")
+					for folder in folderIDs {
+						do {
+							let folder = client.folder(withID: folder)
+							try folder?.setPaused(true)
+						}
+						catch {
+							Log.warn("Failed to delete v1 index: " + error.localizedDescription)
+						}
+					}
+				}
+
+				// Other housekeeping
+				FolderSettingsManager.shared.removeSettingsForFoldersNotIn(Set(folderIDs))
+			}
+			catch let error {
+				Log.warn("Could not start: \(error.localizedDescription)")
+				self.startupState = .error(error.localizedDescription)
+
+				#if os(macOS)
+					self.alert(message: error.localizedDescription)
+				#endif
+			}
+		}
+
+		// Check if we need to show onboarding; if so, we interrupt the startup process here and come back later
+		if self.startupState == .notStarted {
+			Log.info(
+				"Current onboarding version is \(Self.currentOnboardingVersion), user last saw \(self.userSettings.onboardingVersionShown)"
+			)
+
+			if userSettings.onboardingVersionShown < Self.currentOnboardingVersion || userSettings.forceOnboardingOnNextStartup {
+				Log.info("Showing onboarding")
+				self.startupState = .onboarding
+				// OnboardingView will call start() again after finishing
 				return
 			}
-		#endif
-
-		let client = self.client
-		let resetDeltas = UserDefaults.standard.bool(forKey: "resetDeltas")
-		if resetDeltas {
-			Log.info("Reset deltas requested from settings")
+		}
+		else if self.startupState == .onboarding {
+			// We just came out of onboarding, update the version so it is not shown again
+			userSettings.forceOnboardingOnNextStartup = false
+			userSettings.onboardingVersionShown = Self.currentOnboardingVersion
+			try? await Task.sleep(for: .seconds(1))
 		}
 
 		do {
-			// Load the client
-			try await Task.detached(priority: .userInitiated) {
-				// This one opens the database, migrates stuff, etc. and may take a while
-				Log.info("Loading the client...")
-				try client.load(resetDeltas)
-				if resetDeltas {
-					UserDefaults.standard.setValue(false, forKey: "resetDeltas")
-				}
-				Log.info("Client loaded")
-			}.value
-
-			// Resolve bookmarks
-			let folderIDs = client.folders()?.asArray() ?? []
-			for folderID in folderIDs {
-				do {
-					if let bm = try BookmarkManager.shared.resolveBookmark(folderID: folderID) {
-						Log.info("We have a bookmark for folder \(folderID): \(bm)")
-						if let folder = client.folder(withID: folderID) {
-							try folder.setPath(bm.path(percentEncoded: false))
-						}
-						else {
-							Log.warn(
-								"Cannot obtain folder configuration for \(folderID) for setting bookmark; skipping"
-							)
-						}
-					}
-				}
-				catch {
-					Log.warn("Error restoring bookmark for \(folderID): \(error.localizedDescription)")
-				}
-			}
-
-			await self.updateDeviceSuspension()
-
-			// Do we need to pause all folders?
-			let pauseAllFolders = UserDefaults.standard.bool(forKey: "pauseAllFolders")
-			if pauseAllFolders {
-				Log.info("Pausing all folders at the user's request...")
-				UserDefaults.standard.setValue(false, forKey: "pauseAllFolders")
-				for folder in folderIDs {
-					do {
-						let folder = client.folder(withID: folder)
-						try folder?.setPaused(true)
-					}
-					catch {
-						Log.warn("Failed to delete v1 index: " + error.localizedDescription)
-					}
-				}
-			}
-
 			// Start the client
 			try await Task.detached(priority: .userInitiated) {
 				// Showtime!
@@ -255,9 +318,6 @@ struct SyncState {
 				try client.start()
 				Log.info("Client started")
 			}.value
-
-			// Other housekeeping
-			FolderSettingsManager.shared.removeSettingsForFoldersNotIn(Set(folderIDs))
 
 			// Check to see if we have migrated
 			self.isMigratedToNewDatabase = !client.hasLegacyDatabase()
@@ -277,7 +337,6 @@ struct SyncState {
 		}
 		catch let error {
 			Log.warn("Could not start: \(error.localizedDescription)")
-
 			self.startupState = .error(error.localizedDescription)
 
 			#if os(macOS)
@@ -451,6 +510,27 @@ struct SyncState {
 		}
 	}
 
+	nonisolated func getPeersNotSeenForALongTime() async -> [SushitrainPeer] {
+		let interval = await self.userSettings.longTimeNoSeeInterval
+		let ignored = await self.userSettings.ignoreLongTimeNoSeeDevices
+
+		let p = await self.peers()
+		return p.filter {
+			if ignored.contains($0.deviceID()) {
+				return false
+			}
+
+			if $0.isPaused() {
+				return false
+			}
+
+			if let d = $0.lastSeen()?.date() {
+				return -d.timeIntervalSinceNow > interval
+			}
+			return false
+		}
+	}
+
 	nonisolated func folders() async -> [SushitrainFolder] {
 		let client = self.client
 		let folderIDs = client.folders()?.asArray() ?? []
@@ -542,17 +622,19 @@ struct SyncState {
 	func updateBadge() async {
 		await self.updateExtraneousFiles()
 		let numExtra = self.foldersWithExtraFiles.count
+		let numLongTimeNoSee = (await getPeersNotSeenForALongTime()).count
+		let numTotal = numExtra + numLongTimeNoSee
 
 		#if os(iOS)
 			DispatchQueue.main.async {
-				UNUserNotificationCenter.current().setBadgeCount(numExtra)
+				UNUserNotificationCenter.current().setBadgeCount(numTotal)
 			}
 		#elseif os(macOS)
-			let newBadge = numExtra > 0 ? String(numExtra) : ""
+			let newBadge = numTotal > 0 ? String(numTotal) : ""
 			if NSApplication.shared.dockTile.badgeLabel != newBadge {
-				Log.info("Set dock tile badgeLabel \(numExtra)")
+				Log.info("Set dock tile badgeLabel \(numTotal)")
 			}
-			NSApplication.shared.dockTile.showsApplicationBadge = numExtra > 0
+			NSApplication.shared.dockTile.showsApplicationBadge = numTotal > 0
 			NSApplication.shared.dockTile.badgeLabel = newBadge
 			NSApplication.shared.dockTile.display()
 		#endif
@@ -651,6 +733,17 @@ struct SyncState {
 		}
 	}
 
+	func reduceMemoryUsage() {
+		ImageCache.clearMemoryCache()
+
+		Task {
+			try? await goTask {
+				SushitrainClearBlockCache()
+				SushitrainTriggerGC()
+			}
+		}
+	}
+
 	func onScenePhaseChange(from oldPhase: ScenePhase, to newPhase: ScenePhase) {
 		Log.info("Phase change from \(oldPhase) to \(newPhase) lingeringEnabled=\(self.userSettings.lingeringEnabled)")
 
@@ -666,6 +759,7 @@ struct SyncState {
 				await self.updateBadge()
 				#if os(iOS)
 					self.backgroundManager.inactivate()
+					self.reduceMemoryUsage()
 				#endif
 			}
 			#if os(iOS)
@@ -718,7 +812,7 @@ struct SyncState {
 		}
 
 		func cancelLingering() {
-			Log.info("Cancel lingering")
+			Log.info("Cancel lingering lingerTask=\(self.lingerTask.debugDescription)")
 			if let lt = self.lingerTask {
 				UIApplication.shared.endBackgroundTask(lt)
 			}
